@@ -323,6 +323,172 @@ def get_system_info() -> str:
     )
 
 
+@tool(
+    "Suche einen Begriff auf Wikipedia und gib eine kurze Zusammenfassung zurück",
+    {"query": "Der Suchbegriff oder Name, nach dem auf Wikipedia gesucht werden soll"},
+)
+def wiki_search(query: str) -> str:
+    """Ruft die deutsche Wikipedia-Zusammenfassung für einen Begriff ab."""
+    log.info("Wikipedia-Suche: %s", query)
+    # Erst Suche, um den genauen Seitentitel zu finden
+    try:
+        search_resp = httpx.get(
+            "https://de.wikipedia.org/w/api.php",
+            params={"action": "query", "list": "search", "srsearch": query,
+                    "format": "json", "srlimit": 1},
+            timeout=8.0,
+            headers={"User-Agent": "local-voice-agent/1.0"},
+        )
+        search_resp.raise_for_status()
+        results = search_resp.json().get("query", {}).get("search", [])
+        if not results:
+            return f"Kein Wikipedia-Eintrag für '{query}' gefunden."
+        title = results[0]["title"]
+
+        # Zusammenfassung der gefundenen Seite abrufen
+        summary_resp = httpx.get(
+            f"https://de.wikipedia.org/api/rest_v1/page/summary/{title.replace(' ', '_')}",
+            timeout=8.0,
+            headers={"User-Agent": "local-voice-agent/1.0"},
+        )
+        summary_resp.raise_for_status()
+        data = summary_resp.json()
+        extract = data.get("extract", "Keine Zusammenfassung verfügbar.")
+        # Auf ~3 Sätze kürzen für Voice-Ausgabe
+        sentences = extract.split(". ")
+        short = ". ".join(sentences[:3]) + ("." if len(sentences) > 3 else "")
+        return f"{data.get('title', title)}: {short}"
+    except httpx.HTTPStatusError as e:
+        return f"Wikipedia nicht erreichbar (HTTP {e.response.status_code})."
+    except Exception as e:
+        return f"Fehler bei der Wikipedia-Suche: {e}"
+
+
+@tool(
+    "Übersetze einen Text in eine andere Sprache",
+    {
+        "text": "Der zu übersetzende Text",
+        "target_lang": "Zielsprache als Sprachcode, z.B. 'en' für Englisch, 'fr' für Französisch, 'es' für Spanisch",
+        "source_lang": "Quellsprache als Sprachcode (Standard: 'de' für Deutsch)",
+    },
+)
+def translate_text(text: str, target_lang: str, source_lang: str = "de") -> str:
+    """Übersetzt Text via MyMemory API (kostenlos, kein API-Key nötig)."""
+    log.info("Übersetze '%s' von %s nach %s", text[:30], source_lang, target_lang)
+    try:
+        response = httpx.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": text, "langpair": f"{source_lang}|{target_lang}"},
+            timeout=8.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if data.get("responseStatus") != 200:
+            return f"Übersetzung fehlgeschlagen: {data.get('responseDetails', 'Unbekannter Fehler')}"
+        translated = data["responseData"]["translatedText"]
+        return f"Übersetzung ({source_lang} → {target_lang}): {translated}"
+    except httpx.HTTPStatusError as e:
+        return f"Übersetzungsdienst nicht erreichbar (HTTP {e.response.status_code})."
+    except Exception as e:
+        return f"Fehler bei der Übersetzung: {e}"
+
+
+@tool(
+    "Rufe aktuelle Nachrichten ab",
+    {"category": "Nachrichtenkategorie: 'inland', 'ausland', 'wirtschaft', 'sport', 'video' oder leer für Top-Nachrichten"},
+)
+def get_news(category: str = "") -> str:
+    """Ruft aktuelle Nachrichten vom Tagesschau-RSS-Feed ab (kein API-Key nötig)."""
+    import xml.etree.ElementTree as ET
+    import urllib.request
+
+    category_map = {
+        "inland":      "https://www.tagesschau.de/xml/rss2_regional/",
+        "ausland":     "https://www.tagesschau.de/xml/rss2/",
+        "wirtschaft":  "https://www.tagesschau.de/xml/rss2/",
+        "sport":       "https://www.tagesschau.de/xml/rss2/",
+        "video":       "https://www.tagesschau.de/xml/rss2/",
+    }
+    url = category_map.get(category.lower(), "https://www.tagesschau.de/xml/rss2/")
+    log.info("Nachrichten abrufen: %s", url)
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "local-voice-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            xml_data = resp.read()
+        root = ET.fromstring(xml_data)
+        items = root.findall(".//item")[:5]
+        if not items:
+            return "Keine Nachrichten gefunden."
+        lines = []
+        for item in items:
+            title = item.findtext("title", "").strip()
+            desc = item.findtext("description", "").strip()
+            # HTML-Tags entfernen
+            import re
+            desc = re.sub(r"<[^>]+>", "", desc)[:120]
+            lines.append(f"• {title}: {desc}")
+        return "Aktuelle Nachrichten:\n" + "\n\n".join(lines)
+    except Exception as e:
+        return f"Fehler beim Abrufen der Nachrichten: {e}"
+
+
+@tool(
+    "Hänge eine schnelle Notiz an die persönliche Notizdatei an",
+    {"note": "Der Inhalt der Notiz"},
+)
+def quick_note(note: str) -> str:
+    """Hängt eine Notiz mit Zeitstempel an ~/Documents/notizen.md an."""
+    from datetime import datetime
+    log.info("Notiz: %s", note[:50])
+    notes_path = os.path.expanduser("~/Documents/notizen.md")
+    try:
+        os.makedirs(os.path.dirname(notes_path), exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        entry = f"\n- [{timestamp}] {note}"
+        with open(notes_path, "a", encoding="utf-8") as f:
+            f.write(entry)
+        return f"Notiz gespeichert: '{note}'"
+    except Exception as e:
+        return f"Fehler beim Speichern der Notiz: {e}"
+
+
+@tool(
+    "Öffne eine Anwendung oder ein Programm auf dem Computer",
+    {"app": "Name oder Befehl der Anwendung, z.B. 'firefox', 'nautilus', 'gedit', 'thunderbird'"},
+)
+def open_application(app: str) -> str:
+    """Startet eine Anwendung via subprocess."""
+    import subprocess
+    import shutil
+
+    log.info("Öffne Anwendung: %s", app)
+    # Sicherheits-Whitelist: nur bekannte, harmlose Anwendungen
+    ALLOWED_APPS = {
+        "firefox", "chromium", "chromium-browser", "google-chrome",
+        "nautilus", "thunar", "dolphin", "nemo",
+        "gedit", "kate", "mousepad", "xed",
+        "thunderbird", "evolution",
+        "calculator", "gnome-calculator", "kcalc",
+        "terminal", "gnome-terminal", "xterm", "konsole", "alacritty", "kitty",
+        "vlc", "mpv", "rhythmbox", "clementine",
+        "libreoffice", "libreoffice-writer", "libreoffice-calc",
+        "code", "codium",
+    }
+    app_lower = app.lower().strip()
+    if app_lower not in ALLOWED_APPS:
+        return (f"'{app}' ist nicht in der erlaubten Anwendungsliste. "
+                f"Erlaubt: {', '.join(sorted(ALLOWED_APPS))}")
+    if not shutil.which(app_lower):
+        return f"Anwendung '{app}' nicht gefunden oder nicht installiert."
+    try:
+        subprocess.Popen([app_lower], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return f"'{app}' wurde gestartet."
+    except Exception as e:
+        return f"Fehler beim Starten von '{app}': {e}"
+
+
 # --- AGENT LOGIK ---
 def trim_history(messages: list) -> list:
     """Kürzt die Konversationshistorie, um den Kontext nicht zu sprengen."""
