@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 # --- KONFIGURATION ---
 DEVICE = "cuda"
 VOXTRAL_URL = "http://localhost:8000/v1/audio/speech"
-MODEL_NAME = "qwen2.5:7b"
+MODEL_NAME = "mistral-nemo"
 # API-Key in .env Datei setzen (wird automatisch geladen) oder: export SERPER_API_KEY="dein-key"
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 

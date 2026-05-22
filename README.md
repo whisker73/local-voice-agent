@@ -34,7 +34,7 @@
 | Datei | `agent.py` (446 Zeilen) |
 | Python | 3.12.13 (venv) |
 | Paketmanager | [uv](https://github.com/astral-sh/uv) |
-| LLM-Backend | Ollama lokal (`qwen2.5:7b`) |
+| LLM-Backend | Ollama lokal (`mistral-nemo`) |
 | STT | Faster-Whisper `large-v3` (CUDA, int8_float16) |
 | TTS | Voxtral-4B-TTS-2603 via HTTP (`localhost:8000`) |
 | Sprache | Deutsch (`de`) |
@@ -53,7 +53,7 @@
 │                                    get_llm_response()   │
 │                                          │              │
 │                               ┌──────────▼──────────┐  │
-│                               │   Ollama (qwen2.5)  │  │
+│                               │   Ollama (mistral-nemo) │  │
 │                               │   Tool-Call-Schleife │  │
 │                               └──────────┬──────────┘  │
 │                                          │              │
@@ -92,7 +92,7 @@
 - `beam_size=5`, Sprache: `de`
 
 ### LLM – Sprachmodell
-- **Ollama** mit Modell `qwen2.5:7b`
+- **Ollama** mit Modell `mistral-nemo`
 - Läuft vollständig lokal (`127.0.0.1:11434`)
 - Tool-Calling via Ollama-nativer API
 - Konversationshistorie wird mitgeführt und auf **20 Nachrichten** begrenzt
@@ -181,7 +181,7 @@ Das LLM kann maximal **5 Tool-Aufrufe** pro Anfrage machen. Danach gibt es eine 
 ```python
 DEVICE              = "cuda"           # oder "cpu"
 VOXTRAL_URL         = "http://localhost:8000/v1/audio/speech"
-MODEL_NAME          = "qwen2.5:7b"    # Ollama-Modellname
+MODEL_NAME          = "mistral-nemo"    # Ollama-Modellname
 
 STT_LANGUAGE        = "de"
 STT_BEAM_SIZE       = 5
@@ -215,7 +215,7 @@ export SERPER_API_KEY="dein-key"
 ### Voraussetzungen
 - NVIDIA GPU mit CUDA
 - [uv](https://github.com/astral-sh/uv) installiert
-- Ollama läuft lokal mit `qwen2.5:7b` geladen
+- Ollama läuft lokal mit `mistral-nemo` geladen
 - Voxtral TTS-Server läuft auf Port 8000
 - Mikrofon angeschlossen
 
