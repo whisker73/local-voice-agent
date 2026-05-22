@@ -150,6 +150,11 @@ Der Decorator erledigt automatisch:
 | `calculate` | `expression: str` | ❌ | Mathe-Ausdruck auswerten (inkl. `15% von 340`) |
 | `get_weather` | `location: str` | ❌ | Wetter via wttr.in (kostenlos) |
 | `get_system_info` | *(keine)* | ❌ | CPU / RAM / Festplatte |
+| `wiki_search` | `query: str` | ❌ | Wikipedia-Zusammenfassung (de) |
+| `translate_text` | `text, target_lang, source_lang="de"` | ❌ | Übersetzung via MyMemory (kostenlos) |
+| `get_news` | `category=""` | ❌ | Tagesschau RSS (Top/Inland/Ausland/Sport) |
+| `quick_note` | `note: str` | ❌ | Notiz mit Zeitstempel → `~/Documents/notizen.md` |
+| `open_application` | `app: str` | ❌ | App starten (Whitelist-gesichert) |
 
 ### Sicherheit bei Datei-Tools
 
