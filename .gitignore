@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+.env
+*.wav
+Voxtral-4B-TTS-2603/
