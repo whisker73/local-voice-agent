@@ -172,6 +172,157 @@ def read_local_file(filepath: str) -> str:
         return f"Fehler beim Lesen der Datei: {e}"
 
 
+@tool(
+    "Schreibe oder erstelle eine Textdatei im Dokumente-Ordner",
+    {
+        "filepath": "Relativer Pfad zur Datei innerhalb von ~/Documents (z.B. 'notiz.txt')",
+        "content": "Der zu schreibende Inhalt der Datei",
+        "append": "Falls true, wird der Inhalt angehängt statt überschrieben (Standard: false)",
+    },
+)
+def write_file(filepath: str, content: str, append: bool = False) -> str:
+    """Schreibt Inhalt in eine Textdatei im Dokumente-Ordner."""
+    log.info("Schreibe Datei: %s (append=%s)", filepath, append)
+    base_path = os.path.abspath(os.path.expanduser("~/Documents"))
+    path = os.path.abspath(os.path.join(base_path, filepath))
+
+    if not path.startswith(base_path + os.sep):
+        return "Zugriff verweigert: Pfad liegt außerhalb des erlaubten Verzeichnisses."
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        mode = "a" if append else "w"
+        with open(path, mode, encoding="utf-8") as f:
+            f.write(content)
+        action = "angehängt" if append else "geschrieben"
+        return f"Datei '{filepath}' erfolgreich {action}."
+    except Exception as e:
+        return f"Fehler beim Schreiben der Datei: {e}"
+
+
+@tool(
+    "Liste alle Dateien und Ordner im Dokumente-Ordner auf",
+    {"subfolder": "Optionaler Unterordner innerhalb von ~/Documents (leer = Hauptordner)"},
+)
+def list_files(subfolder: str = "") -> str:
+    """Listet den Inhalt des Dokumente-Ordners auf."""
+    log.info("Liste Dateien: %s", subfolder or "~/Documents")
+    base_path = os.path.abspath(os.path.expanduser("~/Documents"))
+    target = os.path.abspath(os.path.join(base_path, subfolder)) if subfolder else base_path
+
+    if not target.startswith(base_path):
+        return "Zugriff verweigert."
+    if not os.path.isdir(target):
+        return f"Ordner '{subfolder}' nicht gefunden."
+
+    try:
+        entries = sorted(os.listdir(target))
+        if not entries:
+            return "Der Ordner ist leer."
+        lines = []
+        for e in entries:
+            full = os.path.join(target, e)
+            marker = "📁" if os.path.isdir(full) else "📄"
+            lines.append(f"{marker} {e}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Fehler beim Auflisten: {e}"
+
+
+@tool("Gibt das aktuelle Datum und die Uhrzeit zurück", {})
+def get_datetime() -> str:
+    """Gibt Datum und Uhrzeit in lesbarem Format zurück."""
+    from datetime import datetime
+    now = datetime.now()
+    return now.strftime("Heute ist %A, der %d. %B %Y. Es ist %H:%M Uhr.")
+
+
+@tool(
+    "Berechne einen mathematischen Ausdruck",
+    {"expression": "Der mathematische Ausdruck als Text, z.B. '15% von 340' oder '(12 * 8) + 5'"},
+)
+def calculate(expression: str) -> str:
+    """Wertet einen mathematischen Ausdruck sicher aus."""
+    log.info("Berechnung: %s", expression)
+    import re
+    from sympy import sympify, SympifyError
+
+    # Prozent-Kurzform auflösen: "15% von 340" → "0.15 * 340"
+    expression = re.sub(
+        r"(\d+(?:\.\d+)?)\s*%\s*(?:von|of)\s*(\d+(?:\.\d+)?)",
+        lambda m: str(float(m.group(1)) / 100 * float(m.group(2))),
+        expression,
+        flags=re.IGNORECASE,
+    )
+    # Einfaches "%" als Division durch 100 auflösen
+    expression = re.sub(r"(\d+(?:\.\d+)?)\s*%", lambda m: str(float(m.group(1)) / 100), expression)
+
+    try:
+        result = sympify(expression)
+        return f"Ergebnis: {result}"
+    except SympifyError:
+        return f"Konnte den Ausdruck nicht berechnen: '{expression}'"
+    except Exception as e:
+        return f"Fehler bei der Berechnung: {e}"
+
+
+@tool(
+    "Zeigt das aktuelle Wetter für einen Ort an",
+    {"location": "Stadt oder Ort, z.B. 'Berlin' oder 'München'"},
+)
+def get_weather(location: str) -> str:
+    """Ruft das aktuelle Wetter via wttr.in ab (kostenlos, kein API-Key)."""
+    log.info("Wetter für: %s", location)
+    try:
+        response = httpx.get(
+            f"https://wttr.in/{location}",
+            params={"format": "j1", "lang": "de"},
+            timeout=8.0,
+            headers={"User-Agent": "local-voice-agent/1.0"},
+        )
+        response.raise_for_status()
+        data = response.json()
+        current = data["current_condition"][0]
+        area = data["nearest_area"][0]
+        city = area["areaName"][0]["value"]
+        country = area["country"][0]["value"]
+        temp_c = current["temp_C"]
+        feels_like = current["FeelsLikeC"]
+        desc = current["lang_de"][0]["value"] if current.get("lang_de") else current["weatherDesc"][0]["value"]
+        humidity = current["humidity"]
+        wind_kmph = current["windspeedKmph"]
+        return (
+            f"Wetter in {city}, {country}:\n"
+            f"  {desc}, {temp_c}°C (gefühlt {feels_like}°C)\n"
+            f"  Luftfeuchtigkeit: {humidity}%, Wind: {wind_kmph} km/h"
+        )
+    except httpx.HTTPStatusError as e:
+        return f"Wetterdienst nicht erreichbar (HTTP {e.response.status_code})."
+    except Exception as e:
+        return f"Fehler beim Abrufen des Wetters: {e}"
+
+
+@tool("Zeigt aktuelle System-Auslastung (CPU, RAM, Festplatte)", {})
+def get_system_info() -> str:
+    """Gibt CPU-, Speicher- und Festplattenauslastung zurück."""
+    import psutil
+    cpu = psutil.cpu_percent(interval=0.5)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+
+    mem_used_gb = mem.used / 1e9
+    mem_total_gb = mem.total / 1e9
+    disk_used_gb = disk.used / 1e9
+    disk_total_gb = disk.total / 1e9
+
+    return (
+        f"System-Auslastung:\n"
+        f"  CPU:       {cpu:.1f}%\n"
+        f"  RAM:       {mem_used_gb:.1f} / {mem_total_gb:.1f} GB ({mem.percent:.1f}%)\n"
+        f"  Festplatte:{disk_used_gb:.1f} / {disk_total_gb:.1f} GB ({disk.percent:.1f}%)"
+    )
+
+
 # --- AGENT LOGIK ---
 def trim_history(messages: list) -> list:
     """Kürzt die Konversationshistorie, um den Kontext nicht zu sprengen."""
