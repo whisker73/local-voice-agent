@@ -1,6 +1,8 @@
 import os
 import io
+import inspect
 import logging
+from typing import Callable, get_type_hints
 import httpx
 import soundfile as sf
 import sounddevice as sd
@@ -37,10 +39,83 @@ log.info("Lade Faster-Whisper (STT)...")
 stt_model = WhisperModel("large-v3", device=DEVICE, compute_type="int8_float16")
 
 
+# --- TOOL-DECORATOR ---
+# Bildet Python-Typen auf JSON-Schema-Typen ab
+_PY_TO_JSON: dict[type, str] = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    list: "array",
+    dict: "object",
+}
+
+# Werden automatisch befüllt – nie manuell anfassen!
+TOOL_REGISTRY: dict[str, Callable] = {}
+tools: list[dict] = []
+
+
+def tool(description: str, param_descriptions: dict[str, str] | None = None):
+    """
+    Decorator: registriert eine Funktion als LLM-Tool.
+
+    Verwendung:
+        @tool("Beschreibung des Tools", {"param": "Beschreibung des Parameters"})
+        def mein_tool(param: str) -> str:
+            ...
+
+    - Erzeugt automatisch das Ollama-JSON-Schema aus den Typ-Hinweisen.
+    - Pflichtparameter (ohne Default) werden automatisch in 'required' aufgenommen.
+    - Registriert die Funktion in TOOL_REGISTRY und tools.
+    """
+    param_descriptions = param_descriptions or {}
+
+    def decorator(func: Callable) -> Callable:
+        hints = get_type_hints(func)
+        hints.pop("return", None)
+        sig = inspect.signature(func)
+
+        properties: dict[str, dict] = {}
+        required: list[str] = []
+
+        for name, param in sig.parameters.items():
+            json_type = _PY_TO_JSON.get(hints.get(name, str), "string")
+            prop: dict = {"type": json_type}
+            if name in param_descriptions:
+                prop["description"] = param_descriptions[name]
+            properties[name] = prop
+            if param.default is inspect.Parameter.empty:
+                required.append(name)
+
+        schema = {
+            "type": "function",
+            "function": {
+                "name": func.__name__,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        }
+
+        TOOL_REGISTRY[func.__name__] = func
+        tools.append(schema)
+        log.debug("Tool registriert: %s", func.__name__)
+        return func
+
+    return decorator
+
+
 # --- TOOLS ---
+@tool(
+    "Suche im Internet nach aktuellen Informationen zu einem Thema",
+    {"query": "Der Suchbegriff"},
+)
 def web_search(query: str) -> str:
     """Sucht mit der Serper Google API und gibt formatierte Ergebnisse zurück."""
-    log.info(f"Web-Suche: {query}")
+    log.info("Web-Suche: %s", query)
     if not SERPER_API_KEY:
         return "Systemhinweis: Websuche nicht möglich – kein SERPER_API_KEY gesetzt."
 
@@ -56,7 +131,6 @@ def web_search(query: str) -> str:
         results = response.json().get("organic", [])[:3]
         if not results:
             return "Keine Suchergebnisse gefunden."
-        # Formatiert für das LLM: Titel + Snippet + URL
         lines = []
         for i, r in enumerate(results, 1):
             lines.append(
@@ -71,9 +145,13 @@ def web_search(query: str) -> str:
         return f"Fehler bei der Websuche: {e}"
 
 
+@tool(
+    "Lese eine Textdatei aus dem Dokumente-Ordner des Benutzers",
+    {"filepath": "Relativer Pfad zur Datei innerhalb von ~/Documents"},
+)
 def read_local_file(filepath: str) -> str:
     """Liest eine Textdatei aus dem Dokumente-Ordner aus."""
-    log.info(f"Lese Datei: {filepath}")
+    log.info("Lese Datei: %s", filepath)
     base_path = os.path.abspath(os.path.expanduser("~/Documents"))
     path = os.path.abspath(os.path.join(base_path, filepath))
 
@@ -88,47 +166,6 @@ def read_local_file(filepath: str) -> str:
         return "Datei nicht gefunden."
     except Exception as e:
         return f"Fehler beim Lesen der Datei: {e}"
-
-
-# Tool-Registry: ermöglicht einfaches Hinzufügen neuer Tools
-TOOL_REGISTRY: dict[str, callable] = {
-    "web_search": web_search,
-    "read_local_file": read_local_file,
-}
-
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Suche im Internet nach aktuellen Informationen zu einem Thema",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Der Suchbegriff"}
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_local_file",
-            "description": "Lese eine Textdatei aus dem Dokumente-Ordner des Benutzers",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filepath": {
-                        "type": "string",
-                        "description": "Relativer Pfad zur Datei innerhalb von ~/Documents",
-                    }
-                },
-                "required": ["filepath"],
-            },
-        },
-    },
-]
 
 
 # --- AGENT LOGIK ---
