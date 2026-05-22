@@ -3,12 +3,16 @@ import io
 import inspect
 import logging
 from typing import Callable, get_type_hints
+from dotenv import load_dotenv
 import httpx
 import soundfile as sf
 import sounddevice as sd
 import speech_recognition as sr
 from faster_whisper import WhisperModel
 import ollama
+
+# Lädt .env Datei (SERPER_API_KEY etc.) – überschreibt keine gesetzten Env-Vars
+load_dotenv()
 
 # --- LOGGING ---
 logging.basicConfig(
@@ -22,7 +26,7 @@ log = logging.getLogger(__name__)
 DEVICE = "cuda"
 VOXTRAL_URL = "http://localhost:8000/v1/audio/speech"
 MODEL_NAME = "qwen2.5:7b"
-# API-Key per Terminal setzen: export SERPER_API_KEY="dein-key"
+# API-Key in .env Datei setzen (wird automatisch geladen) oder: export SERPER_API_KEY="dein-key"
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 
 # STT-Parameter
