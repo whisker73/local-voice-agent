@@ -17,15 +17,23 @@
 8. [Sicherheitshinweise](#sicherheitshinweise)
 9. [Neues Tool hinzufügen](#neues-tool-hinzufügen)
 10. [Bekannte Einschränkungen](#bekannte-einschränkungen)
+5. [Paketmanagement](#paketmanagement)
+6. [Konfiguration](#konfiguration)
+7. [Setup & Start](#setup--start)
+8. [Git-Historie](#git-historie)
+9. [Sicherheitshinweise](#sicherheitshinweise)
+10. [Neues Tool hinzufügen](#neues-tool-hinzufügen)
+11. [Bekannte Einschränkungen](#bekannte-einschränkungen)
 
 ---
 
 ## Übersicht
 
 | Eigenschaft | Wert |
-|---|---|
+|---|---------|
 | Datei | `agent.py` (446 Zeilen) |
 | Python | 3.12.13 (venv) |
+| Paketmanager | [uv](https://github.com/astral-sh/uv) |
 | LLM-Backend | Ollama lokal (`qwen2.5:7b`) |
 | STT | Faster-Whisper `large-v3` (CUDA, int8_float16) |
 | TTS | Voxtral-4B-TTS-2603 via HTTP (`localhost:8000`) |
@@ -201,16 +209,49 @@ export SERPER_API_KEY="dein-key"
 
 ### Voraussetzungen
 - NVIDIA GPU mit CUDA
+- [uv](https://github.com/astral-sh/uv) installiert
 - Ollama läuft lokal mit `qwen2.5:7b` geladen
 - Voxtral TTS-Server läuft auf Port 8000
 - Mikrofon angeschlossen
+
+### venv mit uv
+
+Dieses Projekt verwendet **uv** als Paketmanager. Das venv liegt direkt im Projektordner.
+
+> [!NOTE]
+> `pip` ist in diesem venv **nicht** verfügbar. Alle Paketoperationen laufen über `uv`.
+
+```bash
+# Pakete installieren
+uv pip install <paketname>
+
+# Alle Abhängigkeiten auf einmal (falls requirements.txt vorhanden):
+uv pip install -r requirements.txt
+
+# Einzelnes Paket im Projektkontext:
+uv add <paketname>
+```
 
 ### Starten
 
 ```bash
 # Im Projektverzeichnis:
-source ./venv/bin/activate   # oder: fish start_agent.fish
+source ./venv/bin/activate   # bash/zsh
+# oder:
+fish start_agent.fish         # fish shell
+
 python agent.py
+```
+
+### Neues Paket hinzufügen
+
+```bash
+# Korrekt (uv):
+uv pip install wikipedia-api
+
+# NICHT:
+# pip install wikipedia-api  ← pip nicht verfügbar
+# ./venv/bin/pip install ... ← existiert nicht
 ```
 
 ### Beenden
