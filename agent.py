@@ -1,12 +1,14 @@
 import os
 import io
 import re
+import json
 import inspect
 import logging
 import subprocess
 import shutil
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Callable, get_type_hints
 from urllib.parse import quote
 from dotenv import load_dotenv
@@ -547,7 +549,6 @@ def ha_call_service(domain: str, service: str, entity_id: str, extra: str = "") 
     if not HA_TOKEN:
         return "Systemhinweis: HA_TOKEN nicht gesetzt – Home Assistant nicht konfiguriert."
     log.info("HA call_service: %s.%s(%s)", domain, service, entity_id)
-    import json
     payload: dict = {"entity_id": entity_id}
     if extra:
         try:
@@ -574,6 +575,24 @@ def ha_call_service(domain: str, service: str, entity_id: str, extra: str = "") 
 
 
 # --- AGENT LOGIK ---
+def _parse_text_tool_calls(content: str) -> list:
+    """Fallback: extrahiert Tool-Calls aus Klartext wenn das Modell sie nicht strukturiert liefert."""
+    result = []
+    for m in re.finditer(
+        r'"name"\s*:\s*"(\w+)".*?"arguments"\s*:\s*(\{[^}]*\})',
+        content, re.DOTALL
+    ):
+        name = m.group(1)
+        if name not in TOOL_REGISTRY:
+            continue
+        try:
+            args = json.loads(m.group(2))
+            result.append(SimpleNamespace(function=SimpleNamespace(name=name, arguments=args)))
+        except json.JSONDecodeError:
+            continue
+    return result
+
+
 def trim_history(messages: list) -> list:
     """Kürzt die Konversationshistorie, um den Kontext nicht zu sprengen."""
     system_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
@@ -600,12 +619,17 @@ def get_llm_response(prompt: str, messages: list) -> str:
 
         messages.append(response.message)
 
-        # Keine Tool-Calls → finale Antwort
-        if not response.message.tool_calls:
-            return response.message.content or ""
+        # Strukturierte Tool-Calls bevorzugen; Fallback auf Text-Parsing
+        tool_calls = response.message.tool_calls
+        if not tool_calls:
+            text_calls = _parse_text_tool_calls(response.message.content or "")
+            if not text_calls:
+                return response.message.content or ""
+            log.warning("Modell gab Tool-Call als Klartext aus – Fallback-Parser aktiv")
+            tool_calls = text_calls
 
         # Tool-Aufrufe per Registry abarbeiten
-        for tool_call in response.message.tool_calls:
+        for tool_call in tool_calls:
             name = tool_call.function.name
             args = tool_call.function.arguments
             log.info("Tool-Aufruf [%d/%d]: %s(%s)", iteration + 1, MAX_TOOL_ITERATIONS, name, args)
