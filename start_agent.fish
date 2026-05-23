@@ -1,41 +1,76 @@
 #!/usr/bin/env fish
 
-
-echo "--- GPU Reinigungs-Check ---"
-# Killt gezielt die vLLM Subprozesse, bevor das Skript überhaupt startet
-set ZOMBIES (ps aux | grep -i "VLLM" | grep -v grep | awk '{print $2}')
-if test -n "$ZOMBIES"
-    echo "Found zombie VLLM processes: $ZOMBIES. Killing them..."
-    kill -9 $ZOMBIES
-end
-
-echo "GPU ist sauber. Starte Systeme..."
-# Projekt-Konfiguration
 set PROJECT_DIR /home/whisker/local-voice-agent
-set VENV_PATH $PROJECT_DIR/venv/bin/activate.fish
+set VENV_PATH    $PROJECT_DIR/venv/bin/activate.fish
+set VLLM_LOG     /tmp/voxtral_server.log
+set VLLM_PORT    8000
+set HEALTH_URL   "http://localhost:$VLLM_PORT/health"
+set MAX_WAIT     180  # Sekunden bis Timeout
 
-echo "--- Starte Voxtral & Agent System ---"
+# --- Alte vLLM-Prozesse aufräumen ---
+echo "--- GPU-Reinigungs-Check ---"
+set ZOMBIES (ps aux | grep -iE "vllm|voxtral" | grep -v grep | awk '{print $2}')
+if test -n "$ZOMBIES"
+    echo "Beende vorhandene vLLM-Prozesse: $ZOMBIES"
+    kill -9 $ZOMBIES
+    sleep 2
+end
+echo "GPU ist sauber."
 
-# 1. In das Verzeichnis wechseln
+# --- Venv aktivieren ---
 cd $PROJECT_DIR
-
-# 2. Venv aktivieren
 source $VENV_PATH
 
-# 3. Voxtral Server starten (Hintergrund)
-echo "Starte Voxtral Server mit vllm..."
-vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --gpu-memory-utilization 0.40 &
+# --- Prüfen ob vllm verfügbar ist ---
+if not type -q vllm
+    echo "FEHLER: 'vllm' nicht gefunden. Im venv oder im PATH installiert?"
+    exit 1
+end
+
+# --- Voxtral TTS-Server im Hintergrund starten ---
+# Output geht in Logdatei – kein Durcheinander im Terminal
+echo "Starte Voxtral TTS-Server (Log: $VLLM_LOG)..."
+vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --gpu-memory-utilization 0.40 > $VLLM_LOG 2>&1 &
 set VLLM_PID $last_pid
+echo "vLLM gestartet (PID $VLLM_PID)"
 
-# 4. Warten bis der Server bereit ist (15s Puffer)
-echo "Warte auf Initialisierung der GPU-Kerne..."
-sleep 30
+# --- Warten bis der Server wirklich bereit ist ---
+echo "Warte auf Server-Bereitschaft (max. $MAX_WAIT Sekunden)..."
+set elapsed 0
+while test $elapsed -lt $MAX_WAIT
+    # Prozess abgestürzt?
+    if not kill -0 $VLLM_PID 2>/dev/null
+        echo ""
+        echo "FEHLER: vLLM-Prozess ist abgestürzt! Letzte Log-Zeilen:"
+        tail -30 $VLLM_LOG
+        exit 1
+    end
 
-# 5. Agent starten (Vordergrund)
-echo "Starte Agent.py..."
+    # Server antwortet?
+    if curl -sf $HEALTH_URL > /dev/null 2>&1
+        echo ""
+        echo "Server ist bereit (nach $elapsed Sekunden)."
+        break
+    end
+
+    printf "."
+    sleep 3
+    set elapsed (math $elapsed + 3)
+end
+
+if test $elapsed -ge $MAX_WAIT
+    echo ""
+    echo "FEHLER: Server nicht bereit nach $MAX_WAIT Sekunden. Letzte Log-Zeilen:"
+    tail -30 $VLLM_LOG
+    kill $VLLM_PID 2>/dev/null
+    exit 1
+end
+
+# --- Agent starten (Vordergrund) ---
+echo "Starte Agent..."
 python agent.py
 
-# 6. Aufräumen beim Beenden
-echo "Beende Voxtral Server..."
-kill $VLLM_PID
+# --- Aufräumen ---
+echo "Beende Voxtral Server (PID $VLLM_PID)..."
+kill $VLLM_PID 2>/dev/null
 echo "Fertig."
