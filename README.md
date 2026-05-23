@@ -94,6 +94,7 @@
 - Läuft vollständig lokal (`127.0.0.1:11434`)
 - Tool-Calling via Ollama-nativer API
 - Konversationshistorie wird mitgeführt und auf **20 Nachrichten** begrenzt
+- **Fallback-Parser**: Gibt `mistral-nemo` einen Tool-Call als Klartext statt als strukturierten API-Call aus, extrahiert `_parse_text_tool_calls()` Namen und Argumente per Regex und führt den Aufruf trotzdem korrekt aus
 
 ### TTS – Text-to-Speech
 - **Mistral Voxtral-4B-TTS-2603**
@@ -121,6 +122,7 @@ kein neuer TCP-Handshake pro Anfrage. Der Client wird beim Beenden sauber geschl
 | `sympy` | Sichere Mathe-Auswertung |
 | `psutil` | System-Metriken |
 | `urllib.parse` | URL-Encoding (Stdlib, kein Install nötig) |
+| `json` | JSON-Parsing für HA-Dienste & Fallback-Parser (Stdlib) |
 
 ---
 
@@ -178,6 +180,38 @@ Der Zugriff ist auf `~/Documents` beschränkt. Ein `../../etc/passwd`-Angriff wi
 MAX_TOOL_ITERATIONS = 5
 ```
 Das LLM kann maximal **5 Tool-Aufrufe** pro Anfrage machen. Danach gibt es eine Standardantwort zurück. Verhindert Endlosschleifen.
+
+### Fallback-Parser für Tool-Calls
+
+`mistral-nemo` gibt Tool-Calls gelegentlich als Klartext statt als strukturierten Ollama-API-Call aus. `_parse_text_tool_calls()` fängt diesen Fall ab:
+
+```python
+# Beispiel-Output des Modells (fehlerhaft):
+# vyšip{"name":"ha_get_state","arguments":{"entity_id":""}}
+
+# → Fallback extrahiert name + arguments per Regex und führt den Tool aus
+# → Im Log sichtbar als:
+# [WARNING] Modell gab Tool-Call als Klartext aus – Fallback-Parser aktiv
+```
+
+> [!TIP]
+> Für stabileres Tool-Calling empfehlen sich `qwen2.5:14b` oder `llama3.1:8b`.
+> Modell in `agent.py` via `MODEL_NAME` wechseln.
+
+### Home Assistant
+
+Zwei Tools steuern Home Assistant per Sprache:
+
+| Tool | Wofür |
+|---|---|
+| `ha_get_state` | Zustand abfragen: Temperatur, ob Licht an, Akkustand … |
+| `ha_call_service` | Steuern: Licht, Heizung, Schalter, Szenen, Automationen … |
+
+**Beispiel-Sprachbefehle:**
+- *„Mach das Licht im Wohnzimmer an"* → `ha_call_service(domain="light", service="turn_on", entity_id="light.wohnzimmer")`
+- *„Wie warm ist es im Schlafzimmer?"* → `ha_get_state(entity_id="sensor.schlafzimmer_temperatur")`
+- *„Stell die Heizung auf 21 Grad"* → `ha_call_service(..., extra='{"temperature": 21}')`
+- *„Welche Geräte habe ich?"* → `ha_get_state()` ohne Parameter → listet alle Entitäten auf
 
 ---
 
@@ -247,17 +281,30 @@ export SERPER_API_KEY="dein-key"
 - NVIDIA GPU mit CUDA (empfohlen: RTX 3090 oder besser für `float16`-Betrieb)
 - [uv](https://github.com/astral-sh/uv) installiert
 - Ollama läuft lokal mit `mistral-nemo` geladen
-- Voxtral TTS-Server läuft auf Port 8000
 - Mikrofon angeschlossen
+- Home Assistant erreichbar (optional, für HA-Tools)
 
 ### Starten
 
+**Empfohlen – `start_agent.fish`** (fish shell):
 ```bash
-# Im Projektverzeichnis:
-source ./venv/bin/activate   # bash/zsh
-# oder:
-fish start_agent.fish         # fish shell
+fish start_agent.fish
+```
+Das Script erledigt automatisch:
+1. Ollama-Modell aus VRAM entladen (gibt Speicher für vLLM frei)
+2. Alte vLLM-Prozesse beenden
+3. Voxtral TTS-Server starten (Log: `/tmp/voxtral_server.log`)
+4. Per Health-Check warten bis der Server bereit ist (max. 180 s)
+5. `agent.py` starten
+6. Voxtral beim Beenden sauber stoppen
 
+**Manuell** (zwei Terminals):
+```bash
+# Terminal 1 – Voxtral TTS-Server:
+vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --gpu-memory-utilization 0.40
+
+# Terminal 2 – Agent (nach vollständigem Serverstart):
+source ./venv/bin/activate
 python agent.py
 ```
 
@@ -278,7 +325,11 @@ python agent.py
 | `85faced` | Fix: SERPER_API_KEY via `.env` (python-dotenv) |
 | `ea3fa89` | 6 neue Tools (datetime, calculate, weather, list/write_file, system_info) |
 | `da73b63` | 5 neue Tools (wiki, translate, news, quick_note, open_app) |
-| aktuell | Optimierungen: Connection-Pooling, `float16`-STT, Bugfixes |
+| `5d16983` | Refactor: Connection-Pooling, `float16`-STT, Import-Cleanup, Bugfixes |
+| `95e66d5` | fix start_agent.fish: Health-Check, vLLM-Log, Crash-Erkennung |
+| `45a09f9` | fix start_agent.fish: Ollama-VRAM vor vLLM-Start freigeben |
+| `d0f3ad4` | feat: Home Assistant Integration (`ha_get_state`, `ha_call_service`) |
+| `46002d5` | fix: Fallback-Parser für Text-Tool-Calls (mistral-nemo) |
 
 ---
 
@@ -340,3 +391,5 @@ Unterstützte Typen: `str`, `int`, `float`, `bool`, `list`, `dict`
 | Nur Deutsch | `STT_LANGUAGE = "de"` | Konstante ändern |
 | Dateizugriff nur `~/Documents` | Sicherheits-Design | `base_path` in der Funktion anpassen |
 | `sympy` langsamer erster Start | Lazy-Import beim ersten `calculate`-Aufruf | Unvermeidbar, ~1–2 s Verzögerung |
+| Tool-Calls als Klartext | `mistral-nemo` instabiles Tool-Calling | Fallback-Parser greift automatisch; alternativ Modell wechseln |
+| HA-Entity-ID unbekannt | IDs müssen exakt stimmen | *„Welche Geräte habe ich?"* → alle auflisten lassen |
