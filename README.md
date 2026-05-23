@@ -32,7 +32,7 @@
 | STT | Faster-Whisper `large-v3` (CUDA, `float16`) |
 | TTS | Voxtral-4B-TTS-2603 via HTTP (`localhost:8000`) |
 | Sprache | Deutsch (`de`) |
-| Tools | 13 registrierte Tools |
+| Tools | 15 registrierte Tools |
 
 ---
 
@@ -159,6 +159,8 @@ Der Decorator erledigt automatisch:
 | `get_news` | `category=""` | ❌ | Tagesschau RSS – Top / Inland / Ausland / Wirtschaft / Sport |
 | `quick_note` | `note: str` | ❌ | Notiz mit Zeitstempel → `~/Documents/notizen.md` |
 | `open_application` | `app: str` | ❌ | App starten (Whitelist-gesichert) |
+| `ha_get_state` | `entity_id=""` | ✅ HA-Token | Zustand eines HA-Geräts abfragen (oder alle auflisten) |
+| `ha_call_service` | `domain, service, entity_id, extra=""` | ✅ HA-Token | HA-Dienst aufrufen (Licht, Heizung, Szenen …) |
 
 ### Sicherheit bei Datei-Tools
 
@@ -221,6 +223,10 @@ MAX_HISTORY_MESSAGES = 20             # Max. Nachrichten in Kontext-History
 
 ```env
 SERPER_API_KEY=dein-key-hier
+
+# Home Assistant (Long-Lived Access Token aus HA → Profil → Sicherheit)
+HA_URL=http://homeassistant.local:8123
+HA_TOKEN=dein-token-hier
 ```
 
 > [!IMPORTANT]

@@ -33,8 +33,10 @@ log = logging.getLogger(__name__)
 DEVICE = "cuda"
 VOXTRAL_URL = "http://localhost:8000/v1/audio/speech"
 MODEL_NAME = "mistral-nemo"
-# API-Key in .env Datei setzen (wird automatisch geladen) oder: export SERPER_API_KEY="dein-key"
+# API-Keys in .env setzen (wird automatisch geladen) oder via: export KEY="wert"
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+HA_URL         = os.environ.get("HA_URL", "http://homeassistant.local:8123")
+HA_TOKEN       = os.environ.get("HA_TOKEN", "")
 
 # STT-Parameter
 STT_LANGUAGE = "de"
@@ -481,6 +483,94 @@ def open_application(app: str) -> str:
         return f"'{app}' wurde gestartet."
     except Exception as e:
         return f"Fehler beim Starten von '{app}': {e}"
+
+
+# --- HOME ASSISTANT TOOLS ---
+def _ha_headers() -> dict:
+    return {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
+
+
+@tool(
+    "Frage den Zustand eines Home-Assistant-Geräts ab (z.B. Temperatur, ob ein Licht an ist)",
+    {
+        "entity_id": (
+            "Die Entity-ID des Geräts, z.B. 'light.wohnzimmer', 'sensor.schlafzimmer_temperatur'. "
+            "Leer lassen um alle verfügbaren Entitäten aufzulisten."
+        ),
+    },
+)
+def ha_get_state(entity_id: str = "") -> str:
+    """Ruft den Zustand einer oder aller HA-Entitäten ab."""
+    if not HA_TOKEN:
+        return "Systemhinweis: HA_TOKEN nicht gesetzt – Home Assistant nicht konfiguriert."
+    try:
+        if entity_id:
+            log.info("HA get_state: %s", entity_id)
+            resp = _http.get(f"{HA_URL}/api/states/{entity_id}", headers=_ha_headers(), timeout=8.0)
+            resp.raise_for_status()
+            data = resp.json()
+            state = data.get("state", "unbekannt")
+            attrs = data.get("attributes", {})
+            friendly = attrs.get("friendly_name", entity_id)
+            # Nützliche Attribute je nach Gerätetyp
+            extras = []
+            for key in ("unit_of_measurement", "temperature", "current_temperature",
+                        "brightness", "color_temp", "humidity", "battery"):
+                if key in attrs:
+                    extras.append(f"{key}: {attrs[key]}")
+            detail = f" ({', '.join(extras)})" if extras else ""
+            return f"{friendly}: {state}{detail}"
+        else:
+            log.info("HA get_state: alle Entitäten")
+            resp = _http.get(f"{HA_URL}/api/states", headers=_ha_headers(), timeout=10.0)
+            resp.raise_for_status()
+            entities = resp.json()
+            lines = [f"{e['entity_id']}: {e['state']}" for e in entities]
+            return f"{len(lines)} Entitäten:\n" + "\n".join(lines)
+    except httpx.HTTPStatusError as e:
+        return f"Home Assistant Fehler (HTTP {e.response.status_code}): {e.response.text[:200]}"
+    except Exception as e:
+        return f"Fehler bei HA-Abfrage: {e}"
+
+
+@tool(
+    "Steuere ein Home-Assistant-Gerät oder rufe einen Dienst auf (Licht an/aus, Temperatur setzen, Szene aktivieren …)",
+    {
+        "domain":    "Die Domäne des Dienstes, z.B. 'light', 'switch', 'climate', 'scene', 'automation', 'media_player'",
+        "service":   "Der aufzurufende Dienst, z.B. 'turn_on', 'turn_off', 'toggle', 'set_temperature', 'turn_on' (für Szenen)",
+        "entity_id": "Die Entity-ID des Zielgeräts, z.B. 'light.wohnzimmer' oder 'scene.abend'",
+        "extra":     "Optionale JSON-Zusatzparameter als String, z.B. '{\"temperature\": 21}' oder '{\"brightness\": 128}'",
+    },
+)
+def ha_call_service(domain: str, service: str, entity_id: str, extra: str = "") -> str:
+    """Ruft einen Home-Assistant-Dienst auf."""
+    if not HA_TOKEN:
+        return "Systemhinweis: HA_TOKEN nicht gesetzt – Home Assistant nicht konfiguriert."
+    log.info("HA call_service: %s.%s(%s)", domain, service, entity_id)
+    import json
+    payload: dict = {"entity_id": entity_id}
+    if extra:
+        try:
+            payload.update(json.loads(extra))
+        except json.JSONDecodeError:
+            return f"Ungültiger JSON-Extra-Parameter: {extra}"
+    try:
+        resp = _http.post(
+            f"{HA_URL}/api/services/{domain}/{service}",
+            headers=_ha_headers(),
+            json=payload,
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        changed = resp.json()
+        if changed:
+            names = [e.get("attributes", {}).get("friendly_name", e["entity_id"]) for e in changed]
+            return f"Erledigt: {', '.join(names)}"
+        return "Dienst ausgeführt."
+    except httpx.HTTPStatusError as e:
+        return f"Home Assistant Fehler (HTTP {e.response.status_code}): {e.response.text[:200]}"
+    except Exception as e:
+        return f"Fehler beim HA-Dienst-Aufruf: {e}"
 
 
 # --- AGENT LOGIK ---
