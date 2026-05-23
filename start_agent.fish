@@ -1,11 +1,25 @@
 #!/usr/bin/env fish
 
-set PROJECT_DIR /home/whisker/local-voice-agent
+set PROJECT_DIR  /home/whisker/local-voice-agent
 set VENV_PATH    $PROJECT_DIR/venv/bin/activate.fish
 set VLLM_LOG     /tmp/voxtral_server.log
 set VLLM_PORT    8000
 set HEALTH_URL   "http://localhost:$VLLM_PORT/health"
+set OLLAMA_URL   "http://localhost:11434"
 set MAX_WAIT     180  # Sekunden bis Timeout
+
+# --- Ollama-Modell aus VRAM entladen ---
+echo "--- Ollama VRAM freigeben ---"
+if curl -sf "$OLLAMA_URL/api/tags" > /dev/null 2>&1
+    echo "Ollama läuft – entlade Modelle aus VRAM..."
+    # keep_alive=0 weist Ollama an, das Modell sofort aus dem Speicher zu entfernen
+    curl -sf -X POST "$OLLAMA_URL/api/generate" \
+        -d "{\"model\": \"mistral-nemo\", \"keep_alive\": 0}" > /dev/null 2>&1
+    sleep 1
+    echo "Ollama-VRAM freigegeben."
+else
+    echo "Ollama nicht erreichbar – überspringe."
+end
 
 # --- Alte vLLM-Prozesse aufräumen ---
 echo "--- GPU-Reinigungs-Check ---"
