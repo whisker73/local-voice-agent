@@ -1,10 +1,17 @@
 import os
 import io
+import re
 import inspect
 import logging
+import subprocess
+import shutil
+import xml.etree.ElementTree as ET
+from datetime import datetime
 from typing import Callable, get_type_hints
+from urllib.parse import quote
 from dotenv import load_dotenv
 import httpx
+import psutil
 import soundfile as sf
 import sounddevice as sd
 import speech_recognition as sr
@@ -39,8 +46,24 @@ PHRASE_TIME_LIMIT = 15
 MAX_TOOL_ITERATIONS = 5   # Verhindert Endlosschleifen bei Tool-Calls
 MAX_HISTORY_MESSAGES = 20  # Verhindert Kontext-Overflow
 
+# Geteilter HTTP-Client mit Connection-Pooling (kein neuer TCP-Handshake pro Request)
+_http = httpx.Client(headers={"User-Agent": "local-voice-agent/1.0"})
+
+# Whitelist erlaubter Anwendungen (Konstante, nicht bei jedem Aufruf neu erstellt)
+_ALLOWED_APPS = {
+    "firefox", "chromium", "chromium-browser", "google-chrome",
+    "nautilus", "thunar", "dolphin", "nemo",
+    "gedit", "kate", "mousepad", "xed",
+    "thunderbird", "evolution",
+    "calculator", "gnome-calculator", "kcalc",
+    "terminal", "gnome-terminal", "xterm", "konsole", "alacritty", "kitty",
+    "vlc", "mpv", "rhythmbox", "clementine",
+    "libreoffice", "libreoffice-writer", "libreoffice-calc",
+    "code", "codium",
+}
+
 log.info("Lade Faster-Whisper (STT)...")
-stt_model = WhisperModel("large-v3", device=DEVICE, compute_type="int8_float16")
+stt_model = WhisperModel("large-v3", device=DEVICE, compute_type="float16")
 
 
 # --- TOOL-DECORATOR ---
@@ -123,11 +146,10 @@ def web_search(query: str) -> str:
     if not SERPER_API_KEY:
         return "Systemhinweis: Websuche nicht möglich – kein SERPER_API_KEY gesetzt."
 
-    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
     try:
-        response = httpx.post(
+        response = _http.post(
             "https://google.serper.dev/search",
-            headers=headers,
+            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
             json={"q": query},
             timeout=10.0,
         )
@@ -210,7 +232,8 @@ def list_files(subfolder: str = "") -> str:
     base_path = os.path.abspath(os.path.expanduser("~/Documents"))
     target = os.path.abspath(os.path.join(base_path, subfolder)) if subfolder else base_path
 
-    if not target.startswith(base_path):
+    # os.sep verhindert, dass "/Documents2" als Unterordner von "/Documents" gilt
+    if not (target == base_path or target.startswith(base_path + os.sep)):
         return "Zugriff verweigert."
     if not os.path.isdir(target):
         return f"Ordner '{subfolder}' nicht gefunden."
@@ -232,9 +255,7 @@ def list_files(subfolder: str = "") -> str:
 @tool("Gibt das aktuelle Datum und die Uhrzeit zurück", {})
 def get_datetime() -> str:
     """Gibt Datum und Uhrzeit in lesbarem Format zurück."""
-    from datetime import datetime
-    now = datetime.now()
-    return now.strftime("Heute ist %A, der %d. %B %Y. Es ist %H:%M Uhr.")
+    return datetime.now().strftime("Heute ist %A, der %d. %B %Y. Es ist %H:%M Uhr.")
 
 
 @tool(
@@ -244,7 +265,7 @@ def get_datetime() -> str:
 def calculate(expression: str) -> str:
     """Wertet einen mathematischen Ausdruck sicher aus."""
     log.info("Berechnung: %s", expression)
-    import re
+    # sympy bleibt lazy-import – Startup würde sonst ~1-2s länger dauern
     from sympy import sympify, SympifyError
 
     # Prozent-Kurzform auflösen: "15% von 340" → "0.15 * 340"
@@ -274,11 +295,10 @@ def get_weather(location: str) -> str:
     """Ruft das aktuelle Wetter via wttr.in ab (kostenlos, kein API-Key)."""
     log.info("Wetter für: %s", location)
     try:
-        response = httpx.get(
-            f"https://wttr.in/{location}",
+        response = _http.get(
+            f"https://wttr.in/{quote(location)}",
             params={"format": "j1", "lang": "de"},
             timeout=8.0,
-            headers={"User-Agent": "local-voice-agent/1.0"},
         )
         response.raise_for_status()
         data = response.json()
@@ -305,7 +325,6 @@ def get_weather(location: str) -> str:
 @tool("Zeigt aktuelle System-Auslastung (CPU, RAM, Festplatte)", {})
 def get_system_info() -> str:
     """Gibt CPU-, Speicher- und Festplattenauslastung zurück."""
-    import psutil
     cpu = psutil.cpu_percent(interval=0.5)
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
@@ -330,14 +349,12 @@ def get_system_info() -> str:
 def wiki_search(query: str) -> str:
     """Ruft die deutsche Wikipedia-Zusammenfassung für einen Begriff ab."""
     log.info("Wikipedia-Suche: %s", query)
-    # Erst Suche, um den genauen Seitentitel zu finden
     try:
-        search_resp = httpx.get(
+        search_resp = _http.get(
             "https://de.wikipedia.org/w/api.php",
             params={"action": "query", "list": "search", "srsearch": query,
                     "format": "json", "srlimit": 1},
             timeout=8.0,
-            headers={"User-Agent": "local-voice-agent/1.0"},
         )
         search_resp.raise_for_status()
         results = search_resp.json().get("query", {}).get("search", [])
@@ -345,11 +362,9 @@ def wiki_search(query: str) -> str:
             return f"Kein Wikipedia-Eintrag für '{query}' gefunden."
         title = results[0]["title"]
 
-        # Zusammenfassung der gefundenen Seite abrufen
-        summary_resp = httpx.get(
+        summary_resp = _http.get(
             f"https://de.wikipedia.org/api/rest_v1/page/summary/{title.replace(' ', '_')}",
             timeout=8.0,
-            headers={"User-Agent": "local-voice-agent/1.0"},
         )
         summary_resp.raise_for_status()
         data = summary_resp.json()
@@ -376,7 +391,7 @@ def translate_text(text: str, target_lang: str, source_lang: str = "de") -> str:
     """Übersetzt Text via MyMemory API (kostenlos, kein API-Key nötig)."""
     log.info("Übersetze '%s' von %s nach %s", text[:30], source_lang, target_lang)
     try:
-        response = httpx.get(
+        response = _http.get(
             "https://api.mymemory.translated.net/get",
             params={"q": text, "langpair": f"{source_lang}|{target_lang}"},
             timeout=8.0,
@@ -393,40 +408,35 @@ def translate_text(text: str, target_lang: str, source_lang: str = "de") -> str:
         return f"Fehler bei der Übersetzung: {e}"
 
 
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
 @tool(
     "Rufe aktuelle Nachrichten ab",
     {"category": "Nachrichtenkategorie: 'inland', 'ausland', 'wirtschaft', 'sport', 'video' oder leer für Top-Nachrichten"},
 )
 def get_news(category: str = "") -> str:
     """Ruft aktuelle Nachrichten vom Tagesschau-RSS-Feed ab (kein API-Key nötig)."""
-    import xml.etree.ElementTree as ET
-    import urllib.request
-
     category_map = {
-        "inland":      "https://www.tagesschau.de/xml/rss2_regional/",
-        "ausland":     "https://www.tagesschau.de/xml/rss2/",
-        "wirtschaft":  "https://www.tagesschau.de/xml/rss2/",
-        "sport":       "https://www.tagesschau.de/xml/rss2/",
-        "video":       "https://www.tagesschau.de/xml/rss2/",
+        "inland":     "https://www.tagesschau.de/xml/rss2_inland/",
+        "ausland":    "https://www.tagesschau.de/xml/rss2_ausland/",
+        "wirtschaft": "https://www.tagesschau.de/xml/rss2_wirtschaft/",
+        "sport":      "https://www.tagesschau.de/xml/rss2_sport/",
+        "video":      "https://www.tagesschau.de/xml/rss2/",
     }
     url = category_map.get(category.lower(), "https://www.tagesschau.de/xml/rss2/")
     log.info("Nachrichten abrufen: %s", url)
 
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "local-voice-agent/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            xml_data = resp.read()
-        root = ET.fromstring(xml_data)
+        response = _http.get(url, timeout=8.0)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
         items = root.findall(".//item")[:5]
         if not items:
             return "Keine Nachrichten gefunden."
         lines = []
         for item in items:
             title = item.findtext("title", "").strip()
-            desc = item.findtext("description", "").strip()
-            # HTML-Tags entfernen
-            import re
-            desc = re.sub(r"<[^>]+>", "", desc)[:120]
+            desc = _HTML_TAG_RE.sub("", item.findtext("description", "").strip())[:120]
             lines.append(f"• {title}: {desc}")
         return "Aktuelle Nachrichten:\n" + "\n\n".join(lines)
     except Exception as e:
@@ -439,7 +449,6 @@ def get_news(category: str = "") -> str:
 )
 def quick_note(note: str) -> str:
     """Hängt eine Notiz mit Zeitstempel an ~/Documents/notizen.md an."""
-    from datetime import datetime
     log.info("Notiz: %s", note[:50])
     notes_path = os.path.expanduser("~/Documents/notizen.md")
     try:
@@ -459,26 +468,11 @@ def quick_note(note: str) -> str:
 )
 def open_application(app: str) -> str:
     """Startet eine Anwendung via subprocess."""
-    import subprocess
-    import shutil
-
     log.info("Öffne Anwendung: %s", app)
-    # Sicherheits-Whitelist: nur bekannte, harmlose Anwendungen
-    ALLOWED_APPS = {
-        "firefox", "chromium", "chromium-browser", "google-chrome",
-        "nautilus", "thunar", "dolphin", "nemo",
-        "gedit", "kate", "mousepad", "xed",
-        "thunderbird", "evolution",
-        "calculator", "gnome-calculator", "kcalc",
-        "terminal", "gnome-terminal", "xterm", "konsole", "alacritty", "kitty",
-        "vlc", "mpv", "rhythmbox", "clementine",
-        "libreoffice", "libreoffice-writer", "libreoffice-calc",
-        "code", "codium",
-    }
     app_lower = app.lower().strip()
-    if app_lower not in ALLOWED_APPS:
+    if app_lower not in _ALLOWED_APPS:
         return (f"'{app}' ist nicht in der erlaubten Anwendungsliste. "
-                f"Erlaubt: {', '.join(sorted(ALLOWED_APPS))}")
+                f"Erlaubt: {', '.join(sorted(_ALLOWED_APPS))}")
     if not shutil.which(app_lower):
         return f"Anwendung '{app}' nicht gefunden oder nicht installiert."
     try:
@@ -552,7 +546,7 @@ def listen_and_transcribe(recognizer: sr.Recognizer, source: sr.Microphone) -> s
 
     if text:
         log.info("User: %s", text)
-    return text if len(text) > 2 else ""
+    return text if len(text) > 1 else ""
 
 
 def speak(text: str) -> None:
@@ -566,7 +560,7 @@ def speak(text: str) -> None:
         "voice": "de_female",
     }
     try:
-        response = httpx.post(VOXTRAL_URL, json=payload, timeout=120.0)
+        response = _http.post(VOXTRAL_URL, json=payload, timeout=120.0)
         response.raise_for_status()
         audio_array, sr_rate = sf.read(io.BytesIO(response.content), dtype="float32")
         sd.play(audio_array, sr_rate)
@@ -609,3 +603,5 @@ if __name__ == "__main__":
                 speak(ai_response)
     except KeyboardInterrupt:
         log.info("Agent durch Benutzer beendet.")
+    finally:
+        _http.close()
