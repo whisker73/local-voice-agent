@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
 # --- KONFIGURATION ---
 DEVICE = "cuda"
 VOXTRAL_URL = "http://localhost:8000/v1/audio/speech"
-MODEL_NAME = "mistral-nemo"
+MODEL_NAME = "qwen2.5:7b"
 # API-Keys in .env setzen (wird automatisch geladen) oder via: export KEY="wert"
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 HA_URL         = os.environ.get("HA_URL", "http://homeassistant.local:8123")
@@ -527,8 +527,27 @@ def ha_get_state(entity_id: str = "") -> str:
             resp = _http.get(f"{HA_URL}/api/states", headers=_ha_headers(), timeout=10.0)
             resp.raise_for_status()
             entities = resp.json()
-            lines = [f"{e['entity_id']}: {e['state']}" for e in entities]
-            return f"{len(lines)} Entitäten:\n" + "\n".join(lines)
+            # Interne/uninteressante Domains ausblenden
+            _SKIP_DOMAINS = {"automation", "script", "scene", "zone", "person",
+                             "sun", "weather", "input_boolean", "input_number",
+                             "input_select", "input_text", "timer", "counter",
+                             "persistent_notification", "update"}
+            groups: dict[str, list[str]] = {}
+            for e in entities:
+                domain = e["entity_id"].split(".")[0]
+                if domain in _SKIP_DOMAINS:
+                    continue
+                entity_id = e["entity_id"]
+                name = e.get("attributes", {}).get("friendly_name") or entity_id
+                state = e["state"]
+                groups.setdefault(domain, []).append(f"{name} ({entity_id}): {state}")
+            if not groups:
+                return "Keine Geräte gefunden."
+            lines = []
+            for domain in sorted(groups):
+                lines.append(f"[{domain}]")
+                lines.extend(f"  {item}" for item in groups[domain])
+            return "\n".join(lines)
     except httpx.HTTPStatusError as e:
         return f"Home Assistant Fehler (HTTP {e.response.status_code}): {e.response.text[:200]}"
     except Exception as e:
@@ -635,7 +654,12 @@ def get_llm_response(prompt: str, messages: list) -> str:
             log.info("Tool-Aufruf [%d/%d]: %s(%s)", iteration + 1, MAX_TOOL_ITERATIONS, name, args)
 
             handler = TOOL_REGISTRY.get(name)
-            result = handler(**args) if handler else f"Unbekanntes Tool: {name}"
+            if handler:
+                valid = set(inspect.signature(handler).parameters)
+                args = {k: v for k, v in args.items() if k in valid}
+                result = handler(**args)
+            else:
+                result = f"Unbekanntes Tool: {name}"
             messages.append({"role": "tool", "content": str(result), "name": name})
 
     log.warning("Maximale Tool-Iterationen (%d) erreicht.", MAX_TOOL_ITERATIONS)

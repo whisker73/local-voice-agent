@@ -28,7 +28,7 @@
 | Datei | `agent.py` |
 | Python | 3.12.13 (venv) |
 | Paketmanager | [uv](https://github.com/astral-sh/uv) |
-| LLM-Backend | Ollama lokal (`mistral-nemo`) |
+| LLM-Backend | Ollama lokal (`qwen2.5:7b`) |
 | STT | Faster-Whisper `large-v3` (CUDA, `float16`) |
 | TTS | Voxtral-4B-TTS-2603 via HTTP (`localhost:8000`) |
 | Sprache | Deutsch (`de`) |
@@ -47,7 +47,7 @@
 │                                    get_llm_response()   │
 │                                          │              │
 │                               ┌──────────▼──────────┐  │
-│                               │  Ollama (mistral-nemo)  │  │
+│                               │  Ollama (qwen2.5:7b)  │  │
 │                               │  Tool-Call-Schleife  │  │
 │                               └──────────┬──────────┘  │
 │                                          │              │
@@ -90,11 +90,13 @@
 > bessere Transkriptionsqualität. Bei VRAM-Knappheit (< 8 GB) auf `int8_float16` wechseln.
 
 ### LLM – Sprachmodell
-- **Ollama** mit Modell `mistral-nemo`
+- **Ollama** mit Modell `qwen2.5:7b`
 - Läuft vollständig lokal (`127.0.0.1:11434`)
 - Tool-Calling via Ollama-nativer API
 - Konversationshistorie wird mitgeführt und auf **20 Nachrichten** begrenzt
-- **Fallback-Parser**: Gibt `mistral-nemo` einen Tool-Call als Klartext statt als strukturierten API-Call aus, extrahiert `_parse_text_tool_calls()` Namen und Argumente per Regex und führt den Aufruf trotzdem korrekt aus
+- Zuverlässiges natives Tool-Calling (kein Fallback-Parser nötig)
+- **Fallback-Parser** `_parse_text_tool_calls()` bleibt als Absicherung erhalten, falls das Modell ausnahmsweise Klartext statt strukturiertem API-Call ausgibt
+- **Parameter-Filterung**: Unbekannte Argumente (z.B. modellspezifische Extras wie `toolbench`) werden vor dem Tool-Aufruf automatisch entfernt
 
 ### TTS – Text-to-Speech
 - **Mistral Voxtral-4B-TTS-2603**
@@ -183,20 +185,14 @@ Das LLM kann maximal **5 Tool-Aufrufe** pro Anfrage machen. Danach gibt es eine 
 
 ### Fallback-Parser für Tool-Calls
 
-`mistral-nemo` gibt Tool-Calls gelegentlich als Klartext statt als strukturierten Ollama-API-Call aus. `_parse_text_tool_calls()` fängt diesen Fall ab:
-
-```python
-# Beispiel-Output des Modells (fehlerhaft):
-# vyšip{"name":"ha_get_state","arguments":{"entity_id":""}}
-
-# → Fallback extrahiert name + arguments per Regex und führt den Tool aus
-# → Im Log sichtbar als:
-# [WARNING] Modell gab Tool-Call als Klartext aus – Fallback-Parser aktiv
+`_parse_text_tool_calls()` greift als Absicherung, falls das Modell einen Tool-Call ausnahmsweise als Klartext statt als strukturierten API-Call ausgibt. Im Log sichtbar als:
+```
+[WARNING] Modell gab Tool-Call als Klartext aus – Fallback-Parser aktiv
 ```
 
-> [!TIP]
-> Für stabileres Tool-Calling empfehlen sich `qwen2.5:14b` oder `llama3.1:8b`.
-> Modell in `agent.py` via `MODEL_NAME` wechseln.
+### Parameter-Filterung
+
+Manche Modelle senden nicht im Schema definierte Zusatzparameter (z.B. `toolbench`). Diese werden vor jedem Tool-Aufruf anhand der Funktionssignatur herausgefiltert, damit kein `TypeError` auftritt.
 
 ### Home Assistant
 
@@ -242,7 +238,7 @@ uv add <paketname>
 ```python
 DEVICE              = "cuda"           # oder "cpu"
 VOXTRAL_URL         = "http://localhost:8000/v1/audio/speech"
-MODEL_NAME          = "mistral-nemo"    # Ollama-Modellname
+MODEL_NAME          = "qwen2.5:7b"    # Ollama-Modellname
 
 STT_LANGUAGE        = "de"
 STT_BEAM_SIZE       = 5
@@ -280,7 +276,7 @@ export SERPER_API_KEY="dein-key"
 ### Voraussetzungen
 - NVIDIA GPU mit CUDA (empfohlen: RTX 3090 oder besser für `float16`-Betrieb)
 - [uv](https://github.com/astral-sh/uv) installiert
-- Ollama läuft lokal mit `mistral-nemo` geladen
+- Ollama läuft lokal mit `qwen2.5:7b` geladen
 - Mikrofon angeschlossen
 - Home Assistant erreichbar (optional, für HA-Tools)
 
@@ -297,6 +293,7 @@ Das Script erledigt automatisch:
 4. Per Health-Check warten bis der Server bereit ist (max. 180 s)
 5. `agent.py` starten
 6. Voxtral beim Beenden sauber stoppen
+7. Ollama-Modell aus VRAM entladen (gibt Speicher frei)
 
 **Manuell** (zwei Terminals):
 ```bash
@@ -329,7 +326,9 @@ python agent.py
 | `95e66d5` | fix start_agent.fish: Health-Check, vLLM-Log, Crash-Erkennung |
 | `45a09f9` | fix start_agent.fish: Ollama-VRAM vor vLLM-Start freigeben |
 | `d0f3ad4` | feat: Home Assistant Integration (`ha_get_state`, `ha_call_service`) |
-| `46002d5` | fix: Fallback-Parser für Text-Tool-Calls (mistral-nemo) |
+| `46002d5` | fix: Fallback-Parser für Text-Tool-Calls |
+| `4aea456` | docs: README aktualisiert – HA-Integration, Fallback-Parser, start_agent.fish |
+| *(aktuell)* | feat: qwen2.5:7b; HA-Entityliste gruppiert mit IDs; Parameter-Filterung; Ollama-Entladung beim Stop |
 
 ---
 
@@ -391,5 +390,6 @@ Unterstützte Typen: `str`, `int`, `float`, `bool`, `list`, `dict`
 | Nur Deutsch | `STT_LANGUAGE = "de"` | Konstante ändern |
 | Dateizugriff nur `~/Documents` | Sicherheits-Design | `base_path` in der Funktion anpassen |
 | `sympy` langsamer erster Start | Lazy-Import beim ersten `calculate`-Aufruf | Unvermeidbar, ~1–2 s Verzögerung |
-| Tool-Calls als Klartext | `mistral-nemo` instabiles Tool-Calling | Fallback-Parser greift automatisch; alternativ Modell wechseln |
-| HA-Entity-ID unbekannt | IDs müssen exakt stimmen | *„Welche Geräte habe ich?"* → alle auflisten lassen |
+| Tool-Calls als Klartext | Modell gibt gelegentlich Klartext aus | Fallback-Parser greift automatisch |
+| Unbekannte Tool-Parameter | Modell sendet extra Felder (z.B. `toolbench`) | Werden automatisch vor dem Aufruf gefiltert |
+| HA-Entity-ID unbekannt | IDs müssen exakt stimmen | *„Welche Geräte habe ich?"* → alle auflisten lassen (inkl. Entity-IDs) |
