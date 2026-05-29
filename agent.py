@@ -3,7 +3,6 @@ import io
 import re
 import sys
 import json
-import queue
 import asyncio
 import inspect
 import logging
@@ -163,39 +162,12 @@ def _start_ui_server() -> None:
 
 
 # --- BARGE-IN ---
-_audio_queue: queue.Queue = queue.Queue()
-_is_speaking = threading.Event()
-_barge_in_detected = threading.Event()
-
-# Mindestlänge (Sekunden) für Barge-In – filtert kurze Geräusche heraus
+# Mindestlänge (Sekunden) – filtert kurze Geräusche während TTS heraus
 BARGE_IN_MIN_DURATION = 0.8
 
 
 def _audio_duration(audio: sr.AudioData) -> float:
     return len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
-
-
-def _bg_listener_loop(recognizer: sr.Recognizer, source: sr.Microphone) -> None:
-    """Läuft permanent im Hintergrund, stellt Audio in _audio_queue.
-    Barge-In wird nur ausgelöst wenn das Audio länger als BARGE_IN_MIN_DURATION ist."""
-    log.info("Hintergrund-Listener aktiv.")
-    while True:
-        try:
-            audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=PHRASE_TIME_LIMIT)
-            if _is_speaking.is_set():
-                duration = _audio_duration(audio)
-                if duration < BARGE_IN_MIN_DURATION:
-                    log.debug("Kurzes Geräusch (%.2fs) während TTS – ignoriert.", duration)
-                    continue  # weder queuen noch unterbrechen
-                log.info("Barge-In erkannt (%.2fs) – stoppe TTS.", duration)
-                _barge_in_detected.set()
-                emit("status", state="listening")
-                sd.stop()
-            _audio_queue.put(audio)
-        except sr.WaitTimeoutError:
-            continue
-        except Exception as e:
-            log.warning("Hintergrund-Listener-Fehler: %s", e)
 
 
 # Whitelist erlaubter Anwendungen (Konstante, nicht bei jedem Aufruf neu erstellt)
@@ -845,29 +817,35 @@ def get_llm_response(prompt: str, messages: list) -> str:
     return "Entschuldigung, ich konnte keine abschließende Antwort finden."
 
 
-def listen_and_transcribe() -> str:
-    emit("status", state="listening")
-    try:
-        audio_data = _audio_queue.get(timeout=0.5)
-    except queue.Empty:
-        return ""
-
+def _transcribe_audio(audio_data: sr.AudioData) -> str:
     emit("status", state="transcribing")
     wav_io = io.BytesIO(audio_data.get_wav_data())
     segments, _ = stt_model.transcribe(
         wav_io, beam_size=STT_BEAM_SIZE, language=STT_LANGUAGE, vad_filter=True
     )
     text = "".join(s.text for s in segments).strip()
-
     if text:
         log.info("User: %s", text)
         emit("stt", text=text)
     return text if len(text) > 1 else ""
 
 
-def speak(text: str) -> None:
+def listen_and_transcribe(recognizer: sr.Recognizer, source: sr.Microphone) -> str:
+    emit("status", state="listening")
+    log.info("Bereit – ich höre zu...")
+    try:
+        audio_data = recognizer.listen(
+            source, timeout=LISTEN_TIMEOUT, phrase_time_limit=PHRASE_TIME_LIMIT
+        )
+    except sr.WaitTimeoutError:
+        return ""
+    return _transcribe_audio(audio_data)
+
+
+def speak(text: str, recognizer: sr.Recognizer, source: sr.Microphone) -> sr.AudioData | None:
+    """Spielt TTS-Audio. Gibt aufgenommenes Barge-In-Audio zurück, sonst None."""
     if not text:
-        return
+        return None
     emit("response", text=text)
     emit("status", state="speaking")
     log.info("Agent: %s", text)
@@ -881,25 +859,43 @@ def speak(text: str) -> None:
         response = _http.post(VOXTRAL_URL, json=payload, timeout=120.0)
         response.raise_for_status()
         audio_array, sr_rate = sf.read(io.BytesIO(response.content), dtype="float32")
-        _barge_in_detected.clear()
-        _is_speaking.set()
-        sd.play(audio_array, sr_rate)
-        sd.wait()  # kehrt zurück wenn Wiedergabe endet oder sd.stop() aufgerufen wird
     except httpx.HTTPStatusError as e:
         log.error("TTS-Fehler (HTTP %d): %s", e.response.status_code, e)
+        emit("status", state="idle")
+        return None
     except Exception as e:
         log.error("TTS-Fehler: %s", e)
-    finally:
-        _is_speaking.clear()
-        if not _barge_in_detected.is_set():
-            # Normale Beendigung: TTS-Echo aus Queue verwerfen
-            import time as _t; _t.sleep(0.4)
-            while not _audio_queue.empty():
-                try:
-                    _audio_queue.get_nowait()
-                except queue.Empty:
-                    break
         emit("status", state="idle")
+        return None
+
+    barge_audio: sr.AudioData | None = None
+    stop_event = threading.Event()
+
+    def _barge_listener():
+        nonlocal barge_audio
+        while not stop_event.is_set():
+            try:
+                audio = recognizer.listen(source, timeout=0.5, phrase_time_limit=PHRASE_TIME_LIMIT)
+                if _audio_duration(audio) >= BARGE_IN_MIN_DURATION:
+                    barge_audio = audio
+                    log.info("Barge-In (%.2fs) – stoppe TTS.", _audio_duration(audio))
+                    emit("status", state="listening")
+                    sd.stop()
+                    return
+            except sr.WaitTimeoutError:
+                continue
+
+    listener = threading.Thread(target=_barge_listener, daemon=True)
+    listener.start()
+    sd.play(audio_array, sr_rate)
+    sd.wait()
+    stop_event.set()
+    listener.join(timeout=1.0)
+
+    if barge_audio is None:
+        import time as _t; _t.sleep(0.3)  # Echo abklingen lassen
+    emit("status", state="idle")
+    return barge_audio
 
 
 if __name__ == "__main__":
@@ -944,22 +940,23 @@ if __name__ == "__main__":
             recognizer.adjust_for_ambient_noise(source, duration=2)
             log.info("Kalibrierung abgeschlossen. Los geht's!")
 
-            bg_thread = threading.Thread(
-                target=_bg_listener_loop, args=(recognizer, source),
-                daemon=True, name="bg-listener",
-            )
-            bg_thread.start()
+            pending_audio: sr.AudioData | None = None
 
             while True:
-                user_text = listen_and_transcribe()
+                if pending_audio is not None:
+                    user_text = _transcribe_audio(pending_audio)
+                    pending_audio = None
+                else:
+                    user_text = listen_and_transcribe(recognizer, source)
+
                 if not user_text:
                     continue
                 if "beenden" in user_text.lower():
-                    speak("Ich beende mich nun. Auf Wiedersehen!")
+                    speak("Ich beende mich nun. Auf Wiedersehen!", recognizer, source)
                     break
 
                 ai_response = get_response(user_text, messages)
-                speak(ai_response)
+                pending_audio = speak(ai_response, recognizer, source)
     except KeyboardInterrupt:
         log.info("Agent durch Benutzer beendet.")
     finally:
