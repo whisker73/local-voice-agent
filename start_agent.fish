@@ -82,7 +82,7 @@ end
 
 # --- Agent starten (Vordergrund) ---
 echo "Starte Agent..."
-python agent.py
+python agent.py $argv
 
 # --- Aufräumen ---
 echo "Beende Voxtral Server (PID $VLLM_PID)..."
