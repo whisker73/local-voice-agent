@@ -167,20 +167,31 @@ _audio_queue: queue.Queue = queue.Queue()
 _is_speaking = threading.Event()
 _barge_in_detected = threading.Event()
 
+# Mindestlänge (Sekunden) für Barge-In – filtert kurze Geräusche heraus
+BARGE_IN_MIN_DURATION = 0.8
+
+
+def _audio_duration(audio: sr.AudioData) -> float:
+    return len(audio.frame_data) / (audio.sample_rate * audio.sample_width)
+
 
 def _bg_listener_loop(recognizer: sr.Recognizer, source: sr.Microphone) -> None:
     """Läuft permanent im Hintergrund, stellt Audio in _audio_queue.
-    Erkennt Barge-In während TTS und stoppt die Wiedergabe sofort."""
+    Barge-In wird nur ausgelöst wenn das Audio länger als BARGE_IN_MIN_DURATION ist."""
     log.info("Hintergrund-Listener aktiv.")
     while True:
         try:
             audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=PHRASE_TIME_LIMIT)
-            _audio_queue.put(audio)
             if _is_speaking.is_set():
-                log.info("Barge-In erkannt – stoppe TTS.")
+                duration = _audio_duration(audio)
+                if duration < BARGE_IN_MIN_DURATION:
+                    log.debug("Kurzes Geräusch (%.2fs) während TTS – ignoriert.", duration)
+                    continue  # weder queuen noch unterbrechen
+                log.info("Barge-In erkannt (%.2fs) – stoppe TTS.", duration)
                 _barge_in_detected.set()
                 emit("status", state="listening")
                 sd.stop()
+            _audio_queue.put(audio)
         except sr.WaitTimeoutError:
             continue
         except Exception as e:
