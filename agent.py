@@ -1,9 +1,14 @@
 import os
 import io
 import re
+import sys
 import json
+import queue
+import asyncio
 import inspect
 import logging
+import argparse
+import threading
 import subprocess
 import shutil
 import xml.etree.ElementTree as ET
@@ -19,6 +24,11 @@ import sounddevice as sd
 import speech_recognition as sr
 from faster_whisper import WhisperModel
 import ollama
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+import uvicorn
 
 # Lädt .env Datei (SERPER_API_KEY etc.) – überschreibt keine gesetzten Env-Vars
 load_dotenv()
@@ -50,8 +60,106 @@ PHRASE_TIME_LIMIT = 15
 MAX_TOOL_ITERATIONS = 5   # Verhindert Endlosschleifen bei Tool-Calls
 MAX_HISTORY_MESSAGES = 20  # Verhindert Kontext-Overflow
 
+# Web-UI
+UI_PORT = 7860
+
 # Geteilter HTTP-Client mit Connection-Pooling (kein neuer TCP-Handshake pro Request)
 _http = httpx.Client(headers={"User-Agent": "local-voice-agent/1.0"})
+
+# --- WEB-UI ---
+_ui_loop: asyncio.AbstractEventLoop | None = None
+_ws_connections: list[WebSocket] = []
+
+
+def emit(event_type: str, **kwargs) -> None:
+    if not _ui_loop or not _ws_connections:
+        return
+    data = json.dumps({"type": event_type, **kwargs}, ensure_ascii=False)
+    for ws in list(_ws_connections):
+        asyncio.run_coroutine_threadsafe(_ws_send(ws, data), _ui_loop)
+
+
+async def _ws_send(ws: WebSocket, data: str) -> None:
+    try:
+        await ws.send_text(data)
+    except Exception:
+        try:
+            _ws_connections.remove(ws)
+        except ValueError:
+            pass
+
+
+def _get_config() -> dict:
+    return {
+        "model_name": MODEL_NAME,
+        "stt_language": STT_LANGUAGE,
+        "max_tool_iterations": MAX_TOOL_ITERATIONS,
+        "max_history_messages": MAX_HISTORY_MESSAGES,
+    }
+
+
+class _ConfigUpdate(BaseModel):
+    model_name: str | None = None
+    stt_language: str | None = None
+    max_tool_iterations: int | None = None
+    max_history_messages: int | None = None
+
+
+_app = FastAPI()
+_static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+_app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+
+@_app.get("/")
+async def _root():
+    with open(os.path.join(_static_dir, "index.html"), encoding="utf-8") as f:
+        return HTMLResponse(f.read())
+
+
+@_app.websocket("/ws")
+async def _ws_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    _ws_connections.append(websocket)
+    await websocket.send_text(json.dumps({"type": "config", **_get_config()}))
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        try:
+            _ws_connections.remove(websocket)
+        except ValueError:
+            pass
+
+
+@_app.get("/api/config")
+async def _api_get_config():
+    return _get_config()
+
+
+@_app.post("/api/config")
+async def _api_post_config(update: _ConfigUpdate):
+    global MODEL_NAME, STT_LANGUAGE, MAX_TOOL_ITERATIONS, MAX_HISTORY_MESSAGES
+    if update.model_name is not None:
+        MODEL_NAME = update.model_name
+    if update.stt_language is not None:
+        STT_LANGUAGE = update.stt_language
+    if update.max_tool_iterations is not None:
+        MAX_TOOL_ITERATIONS = update.max_tool_iterations
+    if update.max_history_messages is not None:
+        MAX_HISTORY_MESSAGES = update.max_history_messages
+    cfg = _get_config()
+    emit("config", **cfg)
+    log.info("Konfiguration aktualisiert: %s", cfg)
+    return cfg
+
+
+def _start_ui_server() -> None:
+    global _ui_loop
+    _ui_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_ui_loop)
+    config = uvicorn.Config(_app, host="0.0.0.0", port=UI_PORT, loop="none", log_level="warning")
+    server = uvicorn.Server(config)
+    _ui_loop.run_until_complete(server.serve())
 
 # Whitelist erlaubter Anwendungen (Konstante, nicht bei jedem Aufruf neu erstellt)
 _ALLOWED_APPS = {
@@ -593,6 +701,37 @@ def ha_call_service(domain: str, service: str, entity_id: str, extra: str = "") 
         return f"Fehler beim HA-Dienst-Aufruf: {e}"
 
 
+# --- CLAUDE BACKEND ---
+class ClaudeBackend:
+    """Ruft die Claude Code CLI als Subprocess auf, behält die Session via --continue."""
+
+    def __init__(self):
+        self._first_call = True
+
+    def chat(self, user_text: str) -> str:
+        cmd = ["claude", "-p", user_text, "--output-format", "text"]
+        if not self._first_call:
+            cmd.append("--continue")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self._first_call = False
+            if result.returncode != 0:
+                log.error("Claude CLI Fehler: %s", result.stderr[:200])
+                return "Es gab ein Problem mit Claude. Bitte versuche es erneut."
+            return result.stdout.strip()
+        except FileNotFoundError:
+            return "claude-Befehl nicht gefunden. Ist Claude Code installiert?"
+        except subprocess.TimeoutExpired:
+            return "Claude hat zu lange gebraucht. Bitte versuche es erneut."
+        except Exception as e:
+            return f"Fehler beim Aufruf von Claude: {e}"
+
+
 # --- AGENT LOGIK ---
 def _parse_text_tool_calls(content: str) -> list:
     """Fallback: extrahiert Tool-Calls aus Klartext wenn das Modell sie nicht strukturiert liefert."""
@@ -627,6 +766,7 @@ def get_llm_response(prompt: str, messages: list) -> str:
         messages.append({"role": "user", "content": prompt})
 
     for iteration in range(MAX_TOOL_ITERATIONS):
+        emit("status", state="thinking")
         try:
             response = ollama.chat(
                 model=MODEL_NAME,
@@ -652,6 +792,7 @@ def get_llm_response(prompt: str, messages: list) -> str:
             name = tool_call.function.name
             args = tool_call.function.arguments
             log.info("Tool-Aufruf [%d/%d]: %s(%s)", iteration + 1, MAX_TOOL_ITERATIONS, name, args)
+            emit("tool_call", name=name, args=args if isinstance(args, dict) else {})
 
             handler = TOOL_REGISTRY.get(name)
             if handler:
@@ -660,6 +801,7 @@ def get_llm_response(prompt: str, messages: list) -> str:
                 result = handler(**args)
             else:
                 result = f"Unbekanntes Tool: {name}"
+            emit("tool_result", name=name, result=str(result)[:600])
             messages.append({"role": "tool", "content": str(result), "name": name})
 
     log.warning("Maximale Tool-Iterationen (%d) erreicht.", MAX_TOOL_ITERATIONS)
@@ -667,6 +809,7 @@ def get_llm_response(prompt: str, messages: list) -> str:
 
 
 def listen_and_transcribe(recognizer: sr.Recognizer, source: sr.Microphone) -> str:
+    emit("status", state="listening")
     log.info("Bereit – ich höre zu...")
     try:
         audio_data = recognizer.listen(
@@ -675,7 +818,7 @@ def listen_and_transcribe(recognizer: sr.Recognizer, source: sr.Microphone) -> s
     except sr.WaitTimeoutError:
         return ""
 
-    # In-Memory-Verarbeitung, kein temporäres File auf der Festplatte
+    emit("status", state="transcribing")
     wav_io = io.BytesIO(audio_data.get_wav_data())
     segments, _ = stt_model.transcribe(
         wav_io, beam_size=STT_BEAM_SIZE, language=STT_LANGUAGE, vad_filter=True
@@ -684,12 +827,15 @@ def listen_and_transcribe(recognizer: sr.Recognizer, source: sr.Microphone) -> s
 
     if text:
         log.info("User: %s", text)
+        emit("stt", text=text)
     return text if len(text) > 1 else ""
 
 
 def speak(text: str) -> None:
     if not text:
         return
+    emit("response", text=text)
+    emit("status", state="speaking")
     log.info("Agent: %s", text)
     payload = {
         "input": text,
@@ -707,10 +853,34 @@ def speak(text: str) -> None:
         log.error("TTS-Fehler (HTTP %d): %s", e.response.status_code, e)
     except Exception as e:
         log.error("TTS-Fehler: %s", e)
+    finally:
+        emit("status", state="idle")
 
 
 if __name__ == "__main__":
-    log.info("=== Voxtral-Agent gestartet ===")
+    parser = argparse.ArgumentParser(description="Voxtral Voice Agent")
+    parser.add_argument(
+        "--backend",
+        choices=["ollama", "claude"],
+        default="ollama",
+        help="LLM-Backend: 'ollama' (Standard) oder 'claude' (Claude Code CLI)",
+    )
+    args = parser.parse_args()
+
+    ui_thread = threading.Thread(target=_start_ui_server, daemon=True, name="ui-server")
+    ui_thread.start()
+    log.info("Web-UI verfügbar unter: http://localhost:%d", UI_PORT)
+
+    log.info("=== Voxtral-Agent gestartet (Backend: %s) ===", args.backend)
+
+    if args.backend == "claude":
+        claude_backend = ClaudeBackend()
+        def get_response(user_text: str, messages: list) -> str:
+            return claude_backend.chat(user_text)
+    else:
+        def get_response(user_text: str, messages: list) -> str:
+            return get_llm_response(user_text, messages)
+
     messages = [
         {
             "role": "system",
@@ -737,7 +907,7 @@ if __name__ == "__main__":
                     speak("Ich beende mich nun. Auf Wiedersehen!")
                     break
 
-                ai_response = get_llm_response(user_text, messages)
+                ai_response = get_response(user_text, messages)
                 speak(ai_response)
     except KeyboardInterrupt:
         log.info("Agent durch Benutzer beendet.")
