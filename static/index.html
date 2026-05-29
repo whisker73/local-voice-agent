@@ -498,7 +498,7 @@ function handleEvent(ev) {
       addMessage('user', '🎤', 'Benutzer', escHtml(ev.text));
       break;
     case 'tool_call':
-      addToolCall(ev.name, ev.args || {});
+      if (ev.name) addToolCall(ev.name, ev.args || {});
       break;
     case 'tool_result':
       attachToolResult(ev.name, ev.result || '');
