@@ -28,9 +28,10 @@
 | Datei | `agent.py` |
 | Python | 3.12.13 (venv) |
 | Paketmanager | [uv](https://github.com/astral-sh/uv) |
-| LLM-Backend | Ollama lokal (`qwen2.5:7b`) |
+| LLM-Backend | Ollama lokal (`llama3.1:8b`) oder Claude Code CLI |
 | STT | Faster-Whisper `large-v3` (CUDA, `float16`) |
 | TTS | Voxtral-4B-TTS-2603 via HTTP (`localhost:8000`) |
+| Web-UI | FastAPI + WebSocket (`http://localhost:7860`) |
 | Sprache | Deutsch (`de`) |
 | Tools | 15 registrierte Tools |
 
@@ -39,39 +40,45 @@
 ## Architektur
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                      agent.py                           │
-│                                                         │
-│  Mikrofon ──► STT (Faster-Whisper) ──► Text            │
-│                                          │              │
-│                                    get_llm_response()   │
-│                                          │              │
-│                               ┌──────────▼──────────┐  │
-│                               │  Ollama (qwen2.5:7b)  │  │
-│                               │  Tool-Call-Schleife  │  │
-│                               └──────────┬──────────┘  │
-│                                          │              │
-│                             Tool-Dispatch via Registry  │
-│                             ┌────────────┴──────────┐   │
-│                             │  TOOL_REGISTRY (dict) │   │
-│                             └────────────┬──────────┘   │
-│                                          │              │
-│                      Text ◄─────────────┘              │
-│                        │                               │
-│               speak() ──► TTS (Voxtral) ──► Lautsprecher│
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                         agent.py                             │
+│                                                              │
+│  Mikrofon ──► Hintergrund-Listener-Thread ──► Audio-Queue   │
+│                        │ (Barge-In: sd.stop() bei Sprache)   │
+│                        ▼                                     │
+│               listen_and_transcribe()                        │
+│                        │                                     │
+│               STT (Faster-Whisper large-v3)                  │
+│                        │                                     │
+│                  get_llm_response()                          │
+│                        │                                     │
+│          ┌─────────────▼──────────────┐                     │
+│          │  Ollama (llama3.1:8b)       │                     │
+│          │  Tool-Call-Schleife         │                     │
+│          └─────────────┬──────────────┘                     │
+│                        │                                     │
+│          Tool-Dispatch via TOOL_REGISTRY                     │
+│                        │                                     │
+│                 speak() + Barge-In                           │
+│                        │                                     │
+│             TTS (Voxtral) ──► Lautsprecher                   │
+│                                                              │
+│  Web-UI (FastAPI/WebSocket) ◄──► Browser :7860              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### Gesprächsschleife (Hauptloop)
 
 ```
 1. Mikrofon kalibrieren (2 Sek. Umgebungsgeräusche)
-2. loop:
-   a. Audio aufnehmen (timeout=5s, max=15s/Satz)
-   b. Transkribieren (In-Memory, kein temp-File)
-   c. LLM anfragen → ggf. Tools aufrufen (max. 5 Iterationen)
-   d. Antwort vorlesen (Voxtral TTS)
-   e. "beenden" → Abbruch
+2. Hintergrund-Listener-Thread starten (läuft dauerhaft)
+3. loop:
+   a. Audio aus Queue holen & transkribieren (In-Memory)
+   b. LLM anfragen → ggf. Tools aufrufen (max. 5 Iterationen)
+   c. Antwort vorlesen (Voxtral TTS)
+      – Barge-In: Spricht Benutzer (≥ 0.8 s), TTS wird gestoppt
+      – Kein Barge-In: Queue-Echo 400 ms verwerfen
+   d. "beenden" → Abbruch
 ```
 
 ---
@@ -90,13 +97,25 @@
 > bessere Transkriptionsqualität. Bei VRAM-Knappheit (< 8 GB) auf `int8_float16` wechseln.
 
 ### LLM – Sprachmodell
-- **Ollama** mit Modell `qwen2.5:7b`
+- **Ollama** mit Modell `llama3.1:8b` (Standard) — via `MODEL_NAME` änderbar
+- Alternativ: **Claude Code CLI** (`--backend claude`)
 - Läuft vollständig lokal (`127.0.0.1:11434`)
 - Tool-Calling via Ollama-nativer API
 - Konversationshistorie wird mitgeführt und auf **20 Nachrichten** begrenzt
-- Zuverlässiges natives Tool-Calling (kein Fallback-Parser nötig)
-- **Fallback-Parser** `_parse_text_tool_calls()` bleibt als Absicherung erhalten, falls das Modell ausnahmsweise Klartext statt strukturiertem API-Call ausgibt
-- **Parameter-Filterung**: Unbekannte Argumente (z.B. modellspezifische Extras wie `toolbench`) werden vor dem Tool-Aufruf automatisch entfernt
+- **Fallback-Parser** `_parse_text_tool_calls()` als Absicherung für Klartext-Tool-Calls
+- **Parameter-Filterung**: Unbekannte Modell-Argumente (z.B. `toolbench`) werden vor dem Aufruf gefiltert
+
+### Web-UI
+- **FastAPI** + WebSocket, erreichbar unter `http://localhost:7860`
+- Startet automatisch beim Agent-Start (Hintergrund-Thread)
+- Zeigt Echtzeit-Status (Hört zu / Denkt / Spricht), Conversation-Feed mit Tool-Calls, Konfigurationspanel
+- Konfiguration (Modell, Sprache, Limits) live im Browser änderbar ohne Neustart
+
+### Barge-In
+- Hintergrund-Listener-Thread liest Mikrofon dauerhaft in eine Queue
+- Spricht der Benutzer während TTS läuft und die Äußerung ist **≥ 0.8 s** lang → TTS wird sofort gestoppt (`sd.stop()`), die Eingabe direkt verarbeitet
+- Kurze Geräusche (< 0.8 s) werden während TTS stillschweigend ignoriert
+- Schwellwert: `BARGE_IN_MIN_DURATION = 0.8` (in Sekunden, anpassbar)
 
 ### TTS – Text-to-Speech
 - **Mistral Voxtral-4B-TTS-2603**
@@ -116,15 +135,17 @@ kein neuer TCP-Handshake pro Anfrage. Der Client wird beim Beenden sauber geschl
 |---|---|
 | `faster-whisper` | STT |
 | `ollama` | LLM-Client |
+| `fastapi` | Web-UI HTTP + WebSocket Server |
+| `uvicorn` | ASGI-Server für FastAPI |
+| `pydantic` | Config-Validierung (FastAPI-Abhängigkeit) |
 | `httpx` | HTTP-Requests mit Connection-Pooling |
-| `sounddevice` | Audio-Wiedergabe |
+| `sounddevice` | Audio-Wiedergabe & Barge-In stop |
 | `soundfile` | WAV-Dekodierung |
 | `SpeechRecognition` | Mikrofon-Aufnahme |
 | `python-dotenv` | `.env`-Datei laden |
 | `sympy` | Sichere Mathe-Auswertung |
 | `psutil` | System-Metriken |
-| `urllib.parse` | URL-Encoding (Stdlib, kein Install nötig) |
-| `json` | JSON-Parsing für HA-Dienste & Fallback-Parser (Stdlib) |
+| `urllib.parse` | URL-Encoding (Stdlib) |
 
 ---
 
@@ -238,15 +259,16 @@ uv add <paketname>
 ```python
 DEVICE              = "cuda"           # oder "cpu"
 VOXTRAL_URL         = "http://localhost:8000/v1/audio/speech"
-MODEL_NAME          = "qwen2.5:7b"    # Ollama-Modellname
+MODEL_NAME          = "llama3.1:8b"   # Ollama-Modellname
+UI_PORT             = 7860             # Web-UI Port
 
 STT_LANGUAGE        = "de"
 STT_BEAM_SIZE       = 5
-LISTEN_TIMEOUT      = 5               # Sekunden warten bis Sprache kommt
 PHRASE_TIME_LIMIT   = 15              # Max. Satzlänge in Sekunden
 
 MAX_TOOL_ITERATIONS = 5               # Max. Tool-Calls pro Anfrage
 MAX_HISTORY_MESSAGES = 20             # Max. Nachrichten in Kontext-History
+BARGE_IN_MIN_DURATION = 0.8           # Mindestlänge (s) für Barge-In
 ```
 
 ### `.env` – Secrets (nicht in Git!)
@@ -276,7 +298,7 @@ export SERPER_API_KEY="dein-key"
 ### Voraussetzungen
 - NVIDIA GPU mit CUDA (empfohlen: RTX 3090 oder besser für `float16`-Betrieb)
 - [uv](https://github.com/astral-sh/uv) installiert
-- Ollama läuft lokal mit `qwen2.5:7b` geladen
+- Ollama läuft lokal mit `llama3.1:8b` gepullt (`ollama pull llama3.1:8b`)
 - Mikrofon angeschlossen
 - Home Assistant erreichbar (optional, für HA-Tools)
 
@@ -284,14 +306,15 @@ export SERPER_API_KEY="dein-key"
 
 **Empfohlen – `start_agent.fish`** (fish shell):
 ```bash
-fish start_agent.fish
+fish start_agent.fish              # Ollama-Backend (Standard)
+fish start_agent.fish --backend claude  # Claude Code CLI als LLM
 ```
 Das Script erledigt automatisch:
 1. Ollama-Modell aus VRAM entladen (gibt Speicher für vLLM frei)
 2. Alte vLLM-Prozesse beenden
 3. Voxtral TTS-Server starten (Log: `/tmp/voxtral_server.log`)
 4. Per Health-Check warten bis der Server bereit ist (max. 180 s)
-5. `agent.py` starten
+5. `agent.py` starten → Web-UI unter `http://localhost:7860` verfügbar
 6. Voxtral beim Beenden sauber stoppen
 7. Ollama-Modell aus VRAM entladen (gibt Speicher frei)
 
@@ -302,7 +325,8 @@ vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --gpu-memory-utilization 0.40
 
 # Terminal 2 – Agent (nach vollständigem Serverstart):
 source ./venv/bin/activate
-python agent.py
+python agent.py                    # Ollama-Backend
+python agent.py --backend claude   # Claude Code CLI
 ```
 
 ### Beenden
@@ -327,8 +351,12 @@ python agent.py
 | `45a09f9` | fix start_agent.fish: Ollama-VRAM vor vLLM-Start freigeben |
 | `d0f3ad4` | feat: Home Assistant Integration (`ha_get_state`, `ha_call_service`) |
 | `46002d5` | fix: Fallback-Parser für Text-Tool-Calls |
-| `4aea456` | docs: README aktualisiert – HA-Integration, Fallback-Parser, start_agent.fish |
-| *(aktuell)* | feat: qwen2.5:7b; HA-Entityliste gruppiert mit IDs; Parameter-Filterung; Ollama-Entladung beim Stop |
+| `261f99c` | feat: qwen2.5:7b; HA-Entityliste gruppiert mit IDs; Parameter-Filterung; Ollama-Entladung beim Stop |
+| `3633886` | feat: Web-UI mit FastAPI + WebSocket (Port 7860) |
+| `f673faa` | feat: start_agent.fish leitet Argumente weiter (`--backend claude`) |
+| `2909f7c` | feat: Barge-In – Agent beim Sprechen unterbrechen |
+| `71fed0f` | fix: Barge-In nur bei echter Sprache (≥ 0.8 s) |
+| `729f15b` | chore: Modell auf llama3.1:8b gewechselt |
 
 ---
 
@@ -393,3 +421,5 @@ Unterstützte Typen: `str`, `int`, `float`, `bool`, `list`, `dict`
 | Tool-Calls als Klartext | Modell gibt gelegentlich Klartext aus | Fallback-Parser greift automatisch |
 | Unbekannte Tool-Parameter | Modell sendet extra Felder (z.B. `toolbench`) | Werden automatisch vor dem Aufruf gefiltert |
 | HA-Entity-ID unbekannt | IDs müssen exakt stimmen | *„Welche Geräte habe ich?"* → alle auflisten lassen (inkl. Entity-IDs) |
+| TTS-Echo als Barge-In | Lautsprecher nah am Mikrofon | `BARGE_IN_MIN_DURATION` erhöhen oder Mikrofon weiter weg |
+| Barge-In zu träge | Kurze Wörter unter 0.8 s | `BARGE_IN_MIN_DURATION` auf 0.5 senken |
