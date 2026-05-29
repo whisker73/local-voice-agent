@@ -161,6 +161,32 @@ def _start_ui_server() -> None:
     server = uvicorn.Server(config)
     _ui_loop.run_until_complete(server.serve())
 
+
+# --- BARGE-IN ---
+_audio_queue: queue.Queue = queue.Queue()
+_is_speaking = threading.Event()
+_barge_in_detected = threading.Event()
+
+
+def _bg_listener_loop(recognizer: sr.Recognizer, source: sr.Microphone) -> None:
+    """Läuft permanent im Hintergrund, stellt Audio in _audio_queue.
+    Erkennt Barge-In während TTS und stoppt die Wiedergabe sofort."""
+    log.info("Hintergrund-Listener aktiv.")
+    while True:
+        try:
+            audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=PHRASE_TIME_LIMIT)
+            _audio_queue.put(audio)
+            if _is_speaking.is_set():
+                log.info("Barge-In erkannt – stoppe TTS.")
+                _barge_in_detected.set()
+                emit("status", state="listening")
+                sd.stop()
+        except sr.WaitTimeoutError:
+            continue
+        except Exception as e:
+            log.warning("Hintergrund-Listener-Fehler: %s", e)
+
+
 # Whitelist erlaubter Anwendungen (Konstante, nicht bei jedem Aufruf neu erstellt)
 _ALLOWED_APPS = {
     "firefox", "chromium", "chromium-browser", "google-chrome",
@@ -808,14 +834,11 @@ def get_llm_response(prompt: str, messages: list) -> str:
     return "Entschuldigung, ich konnte keine abschließende Antwort finden."
 
 
-def listen_and_transcribe(recognizer: sr.Recognizer, source: sr.Microphone) -> str:
+def listen_and_transcribe() -> str:
     emit("status", state="listening")
-    log.info("Bereit – ich höre zu...")
     try:
-        audio_data = recognizer.listen(
-            source, timeout=LISTEN_TIMEOUT, phrase_time_limit=PHRASE_TIME_LIMIT
-        )
-    except sr.WaitTimeoutError:
+        audio_data = _audio_queue.get(timeout=0.5)
+    except queue.Empty:
         return ""
 
     emit("status", state="transcribing")
@@ -847,13 +870,24 @@ def speak(text: str) -> None:
         response = _http.post(VOXTRAL_URL, json=payload, timeout=120.0)
         response.raise_for_status()
         audio_array, sr_rate = sf.read(io.BytesIO(response.content), dtype="float32")
+        _barge_in_detected.clear()
+        _is_speaking.set()
         sd.play(audio_array, sr_rate)
-        sd.wait()
+        sd.wait()  # kehrt zurück wenn Wiedergabe endet oder sd.stop() aufgerufen wird
     except httpx.HTTPStatusError as e:
         log.error("TTS-Fehler (HTTP %d): %s", e.response.status_code, e)
     except Exception as e:
         log.error("TTS-Fehler: %s", e)
     finally:
+        _is_speaking.clear()
+        if not _barge_in_detected.is_set():
+            # Normale Beendigung: TTS-Echo aus Queue verwerfen
+            import time as _t; _t.sleep(0.4)
+            while not _audio_queue.empty():
+                try:
+                    _audio_queue.get_nowait()
+                except queue.Empty:
+                    break
         emit("status", state="idle")
 
 
@@ -899,8 +933,14 @@ if __name__ == "__main__":
             recognizer.adjust_for_ambient_noise(source, duration=2)
             log.info("Kalibrierung abgeschlossen. Los geht's!")
 
+            bg_thread = threading.Thread(
+                target=_bg_listener_loop, args=(recognizer, source),
+                daemon=True, name="bg-listener",
+            )
+            bg_thread.start()
+
             while True:
-                user_text = listen_and_transcribe(recognizer, source)
+                user_text = listen_and_transcribe()
                 if not user_text:
                     continue
                 if "beenden" in user_text.lower():
