@@ -873,17 +873,27 @@ def speak(text: str, recognizer: sr.Recognizer, source: sr.Microphone) -> sr.Aud
 
     def _barge_listener():
         nonlocal barge_audio
-        while not stop_event.is_set():
-            try:
-                audio = recognizer.listen(source, timeout=0.5, phrase_time_limit=PHRASE_TIME_LIMIT)
-                if _audio_duration(audio) >= BARGE_IN_MIN_DURATION:
-                    barge_audio = audio
-                    log.info("Barge-In (%.2fs) – stoppe TTS.", _audio_duration(audio))
-                    emit("status", state="listening")
-                    sd.stop()
-                    return
-            except sr.WaitTimeoutError:
-                continue
+        orig_threshold = recognizer.energy_threshold
+        orig_dynamic = recognizer.dynamic_energy_threshold
+        # Fester hoher Threshold damit nur echte Sprache auslöst, kein Atmen
+        recognizer.energy_threshold = max(orig_threshold * 2.5, 4000)
+        recognizer.dynamic_energy_threshold = False
+        log.debug("Barge-In-Threshold: %.0f", recognizer.energy_threshold)
+        try:
+            while not stop_event.is_set():
+                try:
+                    audio = recognizer.listen(source, timeout=0.5, phrase_time_limit=PHRASE_TIME_LIMIT)
+                    if _audio_duration(audio) >= BARGE_IN_MIN_DURATION:
+                        barge_audio = audio
+                        log.info("Barge-In (%.2fs) – stoppe TTS.", _audio_duration(audio))
+                        emit("status", state="listening")
+                        sd.stop()
+                        return
+                except sr.WaitTimeoutError:
+                    continue
+        finally:
+            recognizer.energy_threshold = orig_threshold
+            recognizer.dynamic_energy_threshold = orig_dynamic
 
     listener = threading.Thread(target=_barge_listener, daemon=True)
     listener.start()
