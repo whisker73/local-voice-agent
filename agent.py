@@ -44,7 +44,7 @@ log = logging.getLogger(__name__)
 # --- KONFIGURATION ---
 DEVICE = "cuda"
 VOXTRAL_URL = "http://localhost:8000/v1/audio/speech"
-MODEL_NAME = "qwen2.5:7b"
+MODEL_NAME = "llama3.1:8b"
 # API-Keys in .env setzen (wird automatisch geladen) oder via: export KEY="wert"
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
 HA_URL         = os.environ.get("HA_URL", "http://homeassistant.local:8123")

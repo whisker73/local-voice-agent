@@ -14,7 +14,7 @@ if curl -sf "$OLLAMA_URL/api/tags" > /dev/null 2>&1
     echo "Ollama läuft – entlade Modelle aus VRAM..."
     # keep_alive=0 weist Ollama an, das Modell sofort aus dem Speicher zu entfernen
     curl -sf -X POST "$OLLAMA_URL/api/generate" \
-        -d "{\"model\": \"qwen2.5:7b\", \"keep_alive\": 0}" > /dev/null 2>&1
+        -d "{\"model\": \"llama3.1:8b\", \"keep_alive\": 0}" > /dev/null 2>&1
     sleep 1
     echo "Ollama-VRAM freigegeben."
 else
@@ -92,7 +92,7 @@ kill $VLLM_PID 2>/dev/null
 echo "--- Ollama VRAM freigeben ---"
 if curl -sf "$OLLAMA_URL/api/tags" > /dev/null 2>&1
     curl -sf -X POST "$OLLAMA_URL/api/generate" \
-        -d "{\"model\": \"qwen2.5:7b\", \"keep_alive\": 0}" > /dev/null 2>&1
+        -d "{\"model\": \"llama3.1:8b\", \"keep_alive\": 0}" > /dev/null 2>&1
     echo "Ollama-VRAM freigegeben."
 else
     echo "Ollama nicht erreichbar – überspringe."
