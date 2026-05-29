@@ -1,0 +1,21 @@
+# Direkte Abhängigkeiten von agent.py
+# Installation: uv pip install -r requirements.txt
+
+faster-whisper
+ollama
+httpx
+sounddevice
+soundfile
+SpeechRecognition
+PyAudio
+python-dotenv
+sympy
+psutil
+fastapi
+uvicorn[standard]
+pydantic
+
+# vLLM (Voxtral TTS-Server) wird separat installiert – CUDA erforderlich:
+# uv pip install vllm
+# Modell vorab herunterladen:
+# vllm serve mistralai/Voxtral-4B-TTS-2603 --omni  (lädt beim ersten Start)
